@@ -3,7 +3,7 @@ import json
 import threading
 import time
 
-PI_IP = "192.168.1.50"   # Raspberry Pi IP
+PI_IP = "192.168.0.130"   # Raspberry Pi IP
 UDP_PORT = 5005
 TCP_PORT = 5006
 

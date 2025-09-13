@@ -6,7 +6,7 @@ import time
 # --------------------------
 # Config
 # --------------------------
-CONTROL_PC_IP = "192.168.1.100"   # IP of your control machine
+CONTROL_PC_IP = "192.168.0.67"   # IP of your control machine
 UDP_PORT = 5005
 TCP_PORT = 5006
 
