@@ -73,15 +73,10 @@ class CommandClient(threading.Thread):
     def _send_cmd(self, cmd_value):
         if not self._sock:
             return
-        # Support dict commands for axes/state; fallback to legacy numeric speed
-        if isinstance(cmd_value, dict):
-            payload = cmd_value
-        else:
-            try:
-                payload = {"type": "speed", "value": float(cmd_value)}
-            except Exception:
-                return
-        msg = json.dumps(payload) + "\n"
+        # Only accept dict commands (axes/state). Ignore non-dicts.
+        if not isinstance(cmd_value, dict):
+            return
+        msg = json.dumps(cmd_value) + "\n"
         self._sock.sendall(msg.encode("utf-8"))
 
     def stop(self):
@@ -170,7 +165,7 @@ class RobotGUI(QWidget):
 
         # Stop button
         self.stop_btn = QPushButton("STOP")
-        self.stop_btn.clicked.connect(lambda: self.send_command(0))
+        self.stop_btn.clicked.connect(lambda: self.send_state("estop"))
         layout.addWidget(self.stop_btn)
 
         # --- Telemetry plot ---
@@ -194,9 +189,22 @@ class RobotGUI(QWidget):
         self.timer.timeout.connect(self.update_gui)
         self.timer.start(100)  # update every 100 ms
 
+    def send_axes(self, *_):
+        """Send 6-axis position command in turns."""
+        positions = [float(sp.value()) for sp in self.axis_spins]
+        cmd = {"type": "axes", "positions": positions, "units": "turns"}
+        _queue_put_latest(self.cmd_queue, cmd)
+
+    def send_state(self, state_value: str):
+        """Send robot state command."""
+        cmd = {"type": "state", "value": state_value}
+        _queue_put_latest(self.cmd_queue, cmd)
+
     def send_command(self, value):
-        """Send a command to the robot (via TCP command thread)."""
-        _queue_put_latest(self.cmd_queue, value)
+        """Deprecated: retained for compatibility; prefer send_axes/send_state."""
+        # No-op or translate if needed. Here we just ignore non-dict to avoid speed usage.
+        if isinstance(value, dict):
+            _queue_put_latest(self.cmd_queue, value)
 
     def update_gui(self):
         """Check telemetry and update GUI."""
