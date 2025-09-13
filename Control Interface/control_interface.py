@@ -8,7 +8,7 @@ import json
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
-    QLabel, QSlider, QHBoxLayout
+    QLabel, QSlider, QHBoxLayout, QDoubleSpinBox
 )
 from PyQt6.QtCore import Qt, QTimer
 
@@ -16,8 +16,7 @@ import pyqtgraph as pg
 
 
 # Networking configuration
-# ROBOT_HOST = "192.168.0.130"  # <-- set to your Raspberry Pi IP or hostname
-ROBOT_HOST = "jugglepi.local"
+ROBOT_HOST = "jugglepi.local"  # <-- set to your Raspberry Pi IP or hostname
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
 
@@ -74,7 +73,15 @@ class CommandClient(threading.Thread):
     def _send_cmd(self, cmd_value):
         if not self._sock:
             return
-        msg = json.dumps({"type": "speed", "value": float(cmd_value)}) + "\n"
+        # Support dict commands for axes/state; fallback to legacy numeric speed
+        if isinstance(cmd_value, dict):
+            payload = cmd_value
+        else:
+            try:
+                payload = {"type": "speed", "value": float(cmd_value)}
+            except Exception:
+                return
+        msg = json.dumps(payload) + "\n"
         self._sock.sendall(msg.encode("utf-8"))
 
     def stop(self):
@@ -129,15 +136,37 @@ class RobotGUI(QWidget):
         self.status_label = QLabel("Telemetry: waiting...")
         layout.addWidget(self.status_label)
 
-        # Control slider
-        ctrl_layout = QHBoxLayout()
-        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setRange(-100, 100)
-        self.speed_slider.setValue(0)
-        self.speed_slider.valueChanged.connect(self.send_command)
-        ctrl_layout.addWidget(QLabel("Speed"))
-        ctrl_layout.addWidget(self.speed_slider)
-        layout.addLayout(ctrl_layout)
+        # Axis controls (1-6) in turns
+        axes_layout = QVBoxLayout()
+        self.axis_spins = []
+        for i in range(6):
+            row = QHBoxLayout()
+            lbl = QLabel(f"Axis {i+1} (turns)")
+            spin = QDoubleSpinBox()
+            spin.setDecimals(3)
+            spin.setRange(-10.0, 10.0)
+            spin.setSingleStep(0.01)
+            spin.setValue(0.0)
+            # Send an axes command on any change
+            spin.valueChanged.connect(self.send_axes)
+            row.addWidget(lbl)
+            row.addWidget(spin)
+            axes_layout.addLayout(row)
+            self.axis_spins.append(spin)
+        layout.addLayout(axes_layout)
+
+        # State controls
+        state_layout = QHBoxLayout()
+        self.btn_enable = QPushButton("Enable")
+        self.btn_disable = QPushButton("Disable")
+        self.btn_estop = QPushButton("ESTOP")
+        self.btn_enable.clicked.connect(lambda: self.send_state("enable"))
+        self.btn_disable.clicked.connect(lambda: self.send_state("disable"))
+        self.btn_estop.clicked.connect(lambda: self.send_state("estop"))
+        state_layout.addWidget(self.btn_enable)
+        state_layout.addWidget(self.btn_disable)
+        state_layout.addWidget(self.btn_estop)
+        layout.addLayout(state_layout)
 
         # Stop button
         self.stop_btn = QPushButton("STOP")
@@ -187,7 +216,7 @@ class RobotGUI(QWidget):
         self.curve.setData(self.xdata, self.ydata)
 
 
-# --- Simulated Robot ---  # REMOVED: replaced by real networking
+# --- Simulated Robot ---  # (not used when connected to real robot)
 # def robot_sim(cmd_queue, telem_queue):
 #     ...
 

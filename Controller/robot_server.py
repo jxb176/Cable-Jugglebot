@@ -10,17 +10,11 @@ UDP_TELEM_PORT = 5556
 
 class RobotState:
     def __init__(self):
-        self.speed = 0.0
         self.lock = threading.Lock()
         self.controller_ip = None  # set when TCP client connects
-
-    def set_speed(self, v):
-        with self.lock:
-            self.speed = float(v)
-
-    def get_speed(self):
-        with self.lock:
-            return self.speed
+        # 6-axis targets (turns) and robot state
+        self.axes = [0.0] * 6         # positions in turns
+        self.state = "disable"        # "enable" | "disable" | "estop"
 
     def set_controller_ip(self, ip):
         with self.lock:
@@ -29,6 +23,28 @@ class RobotState:
     def get_controller_ip(self):
         with self.lock:
             return self.controller_ip
+
+    # Axes and state
+    def set_axes(self, positions):
+        if not isinstance(positions, (list, tuple)) or len(positions) != 6:
+            raise ValueError("positions must be length-6 list/tuple")
+        with self.lock:
+            self.axes = [float(x) for x in positions]
+
+    def get_axes(self):
+        with self.lock:
+            return list(self.axes)
+
+    def set_state(self, value: str):
+        value = str(value).lower()
+        if value not in ("enable", "disable", "estop"):
+            raise ValueError("state must be one of: enable, disable, estop")
+        with self.lock:
+            self.state = value
+
+    def get_state(self) -> str:
+        with self.lock:
+            return self.state
 
 def tcp_command_server(state: RobotState):
     """Accepts a single TCP client, receives newline-delimited JSON commands."""
@@ -46,10 +62,15 @@ def tcp_command_server(state: RobotState):
                 for line in f:
                     try:
                         msg = json.loads(line.strip())
-                        if msg.get("type") == "speed":
-                            state.set_speed(msg["value"])
-                            # optional: acknowledge
-                            # conn.sendall(b'{"ok":true}\n')
+                        mtype = msg.get("type")
+                        if mtype == "axes":
+                            positions = msg.get("positions", [])
+                            # units = msg.get("units", "turns")
+                            state.set_axes(positions)
+                        elif mtype == "state":
+                            state.set_state(msg.get("value", "disable"))
+                        else:
+                            print("[TCP] Unknown command type:", mtype)
                     except Exception as e:
                         print("[TCP] Bad command:", e)
         except Exception as e:
@@ -66,9 +87,10 @@ def udp_telemetry_sender(state: RobotState):
         ctrl_ip = state.get_controller_ip()
         if not ctrl_ip:
             continue
-        # Generate telemetry as example: sensor value influenced by speed
-        speed = state.get_speed()
-        val = random.random() * 2 + 0.1 * speed
+        # Example telemetry: derive a single value from axis 1 plus small noise
+        axes = state.get_axes()
+        a1 = axes[0] if axes else 0.0
+        val = a1 + random.uniform(-0.05, 0.05)
         msg = {"t": time.time(), "val": float(val)}
         try:
             sock.sendto(json.dumps(msg).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
@@ -82,14 +104,14 @@ def speed_logger(state: RobotState):
         try:
             print(f"[LOG] Current speed command: {state.get_speed():.2f}")
         except Exception as e:
-            print(f"[LOG] Error reading speed: {e}")
+            print(f"[LOG] Error reading state/axes: {e}")
         time.sleep(1.0)
 
 if __name__ == "__main__":
     state = RobotState()
     threading.Thread(target=tcp_command_server, args=(state,), daemon=True).start()
     threading.Thread(target=udp_telemetry_sender, args=(state,), daemon=True).start()
-    threading.Thread(target=speed_logger, args=(state,), daemon=True).start()
+    threading.Thread(target=axes_state_logger, args=(state,), daemon=True).start()
     print("Robot server running. Press Ctrl+C to exit.")
     while True:
         time.sleep(1)
