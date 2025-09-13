@@ -97,12 +97,17 @@ def udp_telemetry_sender(state: RobotState):
         except Exception as e:
             print("[UDP] Telemetry send error:", e)
 
-# New: 1 Hz speed logger
-def speed_logger(state: RobotState):
-    """Prints the current speed command at 1 Hz."""
+def axes_state_logger(state: RobotState):
+    """Prints current robot state and 6-axis targets at 1 Hz."""
     while True:
         try:
-            print(f"[LOG] Current speed command: {state.get_speed():.2f}")
+            axes = state.get_axes()
+            st = state.get_state()
+            print(
+                f"[LOG] State={st} Axes(turns)=["
+                + ", ".join(f"{x:.3f}" for x in axes)
+                + "]"
+            )
         except Exception as e:
             print(f"[LOG] Error reading state/axes: {e}")
         time.sleep(1.0)
