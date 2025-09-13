@@ -75,10 +75,21 @@ def udp_telemetry_sender(state: RobotState):
         except Exception as e:
             print("[UDP] Telemetry send error:", e)
 
+# New: 1 Hz speed logger
+def speed_logger(state: RobotState):
+    """Prints the current speed command at 1 Hz."""
+    while True:
+        try:
+            print(f"[LOG] Current speed command: {state.get_speed():.2f}")
+        except Exception as e:
+            print(f"[LOG] Error reading speed: {e}")
+        time.sleep(1.0)
+
 if __name__ == "__main__":
     state = RobotState()
     threading.Thread(target=tcp_command_server, args=(state,), daemon=True).start()
     threading.Thread(target=udp_telemetry_sender, args=(state,), daemon=True).start()
+    threading.Thread(target=speed_logger, args=(state,), daemon=True).start()
     print("Robot server running. Press Ctrl+C to exit.")
     while True:
         time.sleep(1)
