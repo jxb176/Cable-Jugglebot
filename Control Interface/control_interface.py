@@ -3,6 +3,8 @@ import threading
 import time
 import random
 from queue import Queue
+import socket
+import json
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
@@ -11,6 +13,104 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 
 import pyqtgraph as pg
+
+
+# Networking configuration
+# ROBOT_HOST = "192.168.0.130"  # <-- set to your Raspberry Pi IP or hostname
+ROBOT_HOST = "jugglepi.local"
+TCP_CMD_PORT = 5555
+UDP_TELEM_PORT = 5556
+
+
+def _queue_put_latest(q: Queue, item):
+    """Keep only the newest item in the queue."""
+    try:
+        while True:
+            q.get_nowait()
+    except Exception:
+        pass
+    q.put(item)
+
+
+class CommandClient(threading.Thread):
+    """TCP client that reliably sends commands to the robot with auto-reconnect."""
+    def __init__(self, host, port, cmd_queue: Queue, status_cb=None):
+        super().__init__(daemon=True)
+        self.host = host
+        self.port = port
+        self.cmd_queue = cmd_queue
+        self.status_cb = status_cb
+        self._stop = threading.Event()
+        self._sock = None
+
+    def run(self):
+        last_cmd = None
+        while not self._stop.is_set():
+            try:
+                # Connect (block/retry)
+                if self.status_cb:
+                    self.status_cb("Connecting to robot (TCP)...")
+                self._sock = socket.create_connection((self.host, self.port), timeout=5)
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if self.status_cb:
+                    self.status_cb("Connected (TCP)")
+                # If we already have a last command, send it after reconnect
+                if last_cmd is not None:
+                    self._send_cmd(last_cmd)
+
+                # Main send loop
+                while not self._stop.is_set():
+                    cmd = self.cmd_queue.get()  # blocks until new command
+                    last_cmd = cmd
+                    self._send_cmd(cmd)
+            except Exception as e:
+                if self.status_cb:
+                    self.status_cb(f"TCP disconnected: {e}. Reconnecting in 1s...")
+                self._close()
+                time.sleep(1)
+
+        self._close()
+
+    def _send_cmd(self, cmd_value):
+        if not self._sock:
+            return
+        msg = json.dumps({"type": "speed", "value": float(cmd_value)}) + "\n"
+        self._sock.sendall(msg.encode("utf-8"))
+
+    def stop(self):
+        self._stop.set()
+        self._close()
+
+    def _close(self):
+        try:
+            if self._sock:
+                self._sock.close()
+        except Exception:
+            pass
+        self._sock = None
+
+
+def telemetry_listener(udp_port: int, telem_queue: Queue, status_cb=None):
+    """Listen for UDP telemetry and push (t, val) into telem_queue."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Reuse addr for quick restarts
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", udp_port))
+    if status_cb:
+        status_cb(f"Telemetry: listening UDP :{udp_port}")
+    while True:
+        try:
+            data, _ = sock.recvfrom(4096)
+            # Expect JSON: {"t": <unix_time>, "val": <float>}
+            telem = json.loads(data.decode("utf-8"))
+            t = float(telem.get("t", time.time()))
+            val = float(telem["val"])
+            telem_queue.put((t, val))
+        except Exception as e:
+            if status_cb:
+                status_cb(f"Telemetry error: {e}")
+            # brief pause to avoid tight loop on persistent error
+            time.sleep(0.05)
 
 
 class RobotGUI(QWidget):
@@ -66,8 +166,8 @@ class RobotGUI(QWidget):
         self.timer.start(100)  # update every 100 ms
 
     def send_command(self, value):
-        """Send a command to the robot (via queue)."""
-        self.cmd_queue.put(value)
+        """Send a command to the robot (via TCP command thread)."""
+        _queue_put_latest(self.cmd_queue, value)
 
     def update_gui(self):
         """Check telemetry and update GUI."""
@@ -87,35 +187,27 @@ class RobotGUI(QWidget):
         self.curve.setData(self.xdata, self.ydata)
 
 
-# --- Simulated Robot ---
-def robot_sim(cmd_queue, telem_queue):
-    """Fake robot that responds to commands and generates telemetry."""
-    speed = 0
-    t0 = time.time()
-
-    while True:
-        # Check if command arrived
-        try:
-            speed = cmd_queue.get_nowait()
-            print(f"[Robot] New speed command: {speed}")
-        except:
-            pass
-
-        # Generate fake telemetry (value drifts with speed)
-        val = random.random() * 2 + 0.1 * speed
-        t = time.time() - t0
-        telem_queue.put((t, val))
-
-        time.sleep(0.1)  # simulate robot update rate (10 Hz)
-
+# --- Simulated Robot ---  # REMOVED: replaced by real networking
+# def robot_sim(cmd_queue, telem_queue):
+#     ...
 
 if __name__ == "__main__":
-    cmd_queue = Queue()
+    cmd_queue = Queue(maxsize=1)   # keep only the latest command
     telem_queue = Queue()
 
-    # Start robot thread
-    t = threading.Thread(target=robot_sim, args=(cmd_queue, telem_queue), daemon=True)
-    t.start()
+    # Start telemetry listener thread (UDP)
+    telem_thread = threading.Thread(
+        target=telemetry_listener,
+        args=(UDP_TELEM_PORT, telem_queue, lambda s: print(s)),
+        daemon=True,
+    )
+    telem_thread.start()
+
+    # Start TCP command client
+    cmd_client = CommandClient(
+        ROBOT_HOST, TCP_CMD_PORT, cmd_queue, status_cb=lambda s: print(s)
+    )
+    cmd_client.start()
 
     # Start GUI
     app = QApplication(sys.argv)
