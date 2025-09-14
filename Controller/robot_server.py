@@ -1,4 +1,3 @@
-
 # robot_server.py
 import socket
 import json
@@ -127,10 +126,14 @@ class RobotState:
     def __init__(self):
         self.lock = threading.Lock()
         self.controller_ip = None
-        self.axes = [0.0] * 6          # turns
+        # 6-axis commanded position targets (turns)
+        self.axes_pos_cmd = [0.0] * 6
         self.state = "disable"         # enable|disable|estop
         self.profile = []
         self.player_thread = None
+        # Per-axis measured feedback (pos_estimate / vel_estimate)
+        self.axes_pos_estimate = [None] * 6
+        self.axes_vel_estimate = [None] * 6
 
     def set_controller_ip(self, ip):
         with self.lock:
@@ -145,12 +148,12 @@ class RobotState:
         if not isinstance(positions, (list, tuple)) or len(positions) != 6:
             raise ValueError("positions must be length-6 list/tuple")
         with self.lock:
-            self.axes = [float(x) for x in positions]
-        logger.info("Axes target set: " + ", ".join(f"{x:.4f}" for x in self.axes))
+            self.axes_pos_cmd = [float(x) for x in positions]
+        logger.info("Axes target set: " + ", ".join(f"{x:.4f}" for x in self.axes_pos_cmd))
 
     def get_axes(self):
         with self.lock:
-            return list(self.axes)
+            return list(self.axes_pos_cmd)
 
     def set_state(self, value: str):
         value = str(value).lower()
@@ -163,6 +166,28 @@ class RobotState:
     def get_state(self) -> str:
         with self.lock:
             return self.state
+
+    # Feedback setters/getters (per-axis)
+    def set_axis_feedback(self, axis_id: int, pos_estimate=None, vel_estimate=None):
+        """Store measured feedback for a single axis index (0..5)."""
+        if not (0 <= int(axis_id) < 6):
+            return
+        with self.lock:
+            if pos_estimate is not None:
+                try:
+                    self.axes_pos_estimate[axis_id] = float(pos_estimate)
+                except Exception:
+                    pass
+            if vel_estimate is not None:
+                try:
+                    self.axes_vel_estimate[axis_id] = float(vel_estimate)
+                except Exception:
+                    pass
+
+    def get_feedback(self):
+        """Return (pos_estimate[6], vel_estimate[6]) lists (may contain None)."""
+        with self.lock:
+            return (list(self.axes_pos_estimate), list(self.axes_vel_estimate))
 
     def set_profile(self, profile_points):
         if not isinstance(profile_points, (list, tuple)) or len(profile_points) == 0:
@@ -255,6 +280,36 @@ class ODriveCANBridge(threading.Thread):
     def _feedback_cb(self, axis_id: int):
         def _cb(msg, caller):
             print(f"[ODRV] axis={axis_id} feedback: {msg}")
+            # Try to extract pos_estimate / vel_estimate from msg
+            pos_val = None
+            vel_val = None
+            try:
+                # Attribute-style
+                if hasattr(msg, "pos_estimate"):
+                    pos_val = float(getattr(msg, "pos_estimate"))
+                if hasattr(msg, "vel_estimate"):
+                    vel_val = float(getattr(msg, "vel_estimate"))
+                # Dict-style in msg.data
+                data = getattr(msg, "data", None)
+                if isinstance(data, dict):
+                    if pos_val is None and "pos_estimate" in data:
+                        pos_val = float(data["pos_estimate"])
+                    if vel_val is None and "vel_estimate" in data:
+                        vel_val = float(data["vel_estimate"])
+                # Tuple/list-style [pos, vel]
+                if (pos_val is None or vel_val is None) and isinstance(data, (list, tuple)) and len(data) >= 2:
+                    if pos_val is None:
+                        pos_val = float(data[0])
+                    if vel_val is None:
+                        vel_val = float(data[1])
+            except Exception:
+                # ignore parse errors
+                pass
+
+            # Store into RobotState per-axis feedback
+            if pos_val is not None or vel_val is not None:
+                self.state.set_axis_feedback(axis_id, pos_estimate=pos_val, vel_estimate=vel_val)
+
             self._feedback_seen[axis_id] = self._feedback_seen.get(axis_id, 0) + 1
         return _cb
 
@@ -438,6 +493,7 @@ def udp_telemetry_sender(state: RobotState):
             continue
         axes = state.get_axes()
         a1 = axes[0] if axes else 0.0
+        # write random value
         val = a1 + random.uniform(-0.05, 0.05)
         msg = {"t": time.time(), "val": float(val)}
         try:
