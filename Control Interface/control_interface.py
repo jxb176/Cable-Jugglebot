@@ -627,10 +627,18 @@ class RobotGUI(QWidget):
 #     ...
 
 if __name__ == "__main__":
+    # Start GUI first to ensure the window appears immediately
+    app = QApplication(sys.argv)
+
     cmd_queue = Queue(maxsize=1)   # keep only the latest command
     telem_queue = Queue()
 
-    # Start telemetry listener thread (UDP)
+    gui = RobotGUI(cmd_queue, telem_queue)
+    gui.status_label.setText("Starting...")
+    gui.show()
+
+    # Now start background threads (non-blocking)
+    # Telemetry listener (UDP)
     telem_thread = threading.Thread(
         target=telemetry_listener,
         args=(UDP_TELEM_PORT, telem_queue, lambda s: print(s)),
@@ -638,14 +646,11 @@ if __name__ == "__main__":
     )
     telem_thread.start()
 
-    # Start TCP command client
+    # TCP command client
     cmd_client = CommandClient(
         ROBOT_HOST, TCP_CMD_PORT, cmd_queue, status_cb=lambda s: print(s)
     )
     cmd_client.start()
 
-    # Start GUI
-    app = QApplication(sys.argv)
-    gui = RobotGUI(cmd_queue, telem_queue)
-    gui.show()
+    # Enter Qt event loop
     sys.exit(app.exec())
