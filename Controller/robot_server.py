@@ -262,15 +262,45 @@ class ODriveCANBridge(threading.Thread):
 
         for aid in AXIS_NODE_IDS:
             try:
-                drv = odc.ODriveCAN(axis_id=aid, interface=ODRIVE_INTERFACE)
+                drv = None
+                last_err = None
+
+                # Try several likely constructor signatures in order
+                ctor_attempts = [
+                    ("kw axis_id+interface",      lambda: odc.ODriveCAN(axis_id=aid, interface=ODRIVE_INTERFACE)),
+                    ("kw axis_id+channel",        lambda: odc.ODriveCAN(axis_id=aid, channel=ODRIVE_INTERFACE)),
+                    ("kw axis_id+bus",            lambda: odc.ODriveCAN(axis_id=aid, bus=ODRIVE_INTERFACE)),
+                    ("pos (axis_id, interface)",  lambda: odc.ODriveCAN(aid, ODRIVE_INTERFACE)),
+                    ("pos (axis_id,)",            lambda: odc.ODriveCAN(aid)),
+                    ("kw axis_id only",           lambda: odc.ODriveCAN(axis_id=aid)),
+                ]
+
+                for label, factory in ctor_attempts:
+                    try:
+                        drv = factory()
+                        logger.info(f"ODrive axis {aid}: constructed with '{label}'")
+                        break
+                    except TypeError as e:
+                        last_err = e
+                        continue
+                    except Exception as e:
+                        last_err = e
+                        continue
+
+                if drv is None:
+                    raise RuntimeError(f"ODriveCAN constructor not compatible for axis {aid}: {last_err}")
+
+                # Attach feedback callback and start
                 drv.feedback_callback = self._feedback_cb(aid)
                 await drv.start()
+
                 # Optional: configure controller mode for position control (per your example)
                 drv.check_errors()
                 drv.set_controller_mode("POSITION_CONTROL", "POS_FILTER")
                 drv.set_linear_count(0)
+
                 self._drivers.append((aid, drv))
-                logger.info(f"ODrive axis {aid} started on {ODRIVE_INTERFACE}")
+                logger.info(f"ODrive axis {aid} started on '{ODRIVE_INTERFACE}'")
             except Exception as e:
                 logger.error(f"Failed to init ODrive axis {aid}: {e}")
 
