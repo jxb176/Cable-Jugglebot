@@ -230,6 +230,127 @@ except NameError:
             while not self._stop.is_set():
                 time.sleep(0.5)
 
+# Fallback: define tcp_command_server if missing
+try:
+    tcp_command_server  # type: ignore[name-defined]
+except NameError:
+    def tcp_command_server(state):
+        """Minimal TCP command server accepting axes/state/profile messages."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("0.0.0.0", TCP_CMD_PORT))
+        except OSError as e:
+            try:
+                logger.error(f"[TCP] Bind failed on :{TCP_CMD_PORT} ({e}). Exiting tcp thread.")
+            except Exception:
+                print(f"[TCP] Bind failed on :{TCP_CMD_PORT} ({e}). Exiting tcp thread.")
+            return
+        srv.listen(1)
+        try:
+            logger.info(f"[TCP] Listening on :{TCP_CMD_PORT}")
+        except Exception:
+            print(f"[TCP] Listening on :{TCP_CMD_PORT}")
+        while True:
+            conn, addr = srv.accept()
+            try:
+                logger.info(f"[TCP] Controller connected from {addr}")
+            except Exception:
+                print(f"[TCP] Controller connected from {addr}")
+            state.set_controller_ip(addr[0])
+            try:
+                with conn, conn.makefile("r") as f:
+                    for line in f:
+                        try:
+                            msg = json.loads(line.strip())
+                            mtype = msg.get("type")
+                            if mtype == "axes":
+                                state.set_axes(msg.get("positions", []))
+                            elif mtype == "state":
+                                state.set_state(msg.get("value", "disable"))
+                            elif mtype == "profile_upload":
+                                state.set_profile(msg.get("profile", []))
+                            elif mtype == "profile_start":
+                                rate_hz = float(msg.get("rate_hz", 100.0))
+                                state.start_profile(rate_hz)
+                            elif mtype == "profile_stop":
+                                state.stop_profile()
+                            else:
+                                try:
+                                    logger.warning(f"[TCP] Unknown command type: {mtype}")
+                                except Exception:
+                                    print(f"[TCP] Unknown command type: {mtype}")
+                        except Exception as e:
+                            try:
+                                logger.error(f"[TCP] Bad command: {e}")
+                            except Exception:
+                                print(f"[TCP] Bad command: {e}")
+            except Exception as e:
+                try:
+                    logger.error(f"[TCP] Connection error: {e}")
+                except Exception:
+                    print(f"[TCP] Connection error: {e}")
+            finally:
+                state.stop_profile()
+                try:
+                    logger.info("[TCP] Controller disconnected")
+                except Exception:
+                    print("[TCP] Controller disconnected")
+
+# Fallback: define udp_telemetry_sender if missing
+try:
+    udp_telemetry_sender  # type: ignore[name-defined]
+except NameError:
+    def udp_telemetry_sender(state):
+        """Sends pos/vel arrays (or fallbacks) over UDP at ~10 Hz."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while True:
+            time.sleep(0.1)
+            ctrl_ip = state.get_controller_ip()
+            if not ctrl_ip:
+                continue
+            # Try to use feedback if available; fall back to targets & zeros
+            try:
+                fb_pos, fb_vel = state.get_feedback()
+            except Exception:
+                fb_pos, fb_vel = ([], [])
+            if not fb_pos or len(fb_pos) != 6:
+                fb_pos = state.get_axes()
+            if not fb_vel or len(fb_vel) != 6:
+                fb_vel = [0.0] * 6
+            msg = {
+                "t": time.time(),
+                "pos": [float(x) for x in fb_pos],
+                "vel": [float(x) for x in fb_vel],
+            }
+            try:
+                sock.sendto(json.dumps(msg).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
+            except Exception as e:
+                try:
+                    logger.error(f"[UDP] Telemetry send error: {e}")
+                except Exception:
+                    print(f"[UDP] Telemetry send error: {e}")
+
+# Fallback: define axes_state_logger if missing
+try:
+    axes_state_logger  # type: ignore[name-defined]
+except NameError:
+    def axes_state_logger(state):
+        """Logs current state and targets at 1 Hz."""
+        while True:
+            try:
+                axes = state.get_axes()
+                st = state.get_state()
+                logger.info(f"[LOG] State={st} Axes(turns)=[" +
+                            ", ".join(f"{x:.3f}" for x in axes) + "]")
+            except Exception as e:
+                try:
+                    logger.error(f"[LOG] Error reading state/axes: {e}")
+                except Exception:
+                    print(f"[LOG] Error reading state/axes: {e}")
+            time.sleep(1.0)
+
+# --- main ---
 if __name__ == "__main__":
     state = RobotState()
 
@@ -240,10 +361,16 @@ if __name__ == "__main__":
     threading.Thread(target=tcp_command_server, args=(state,), daemon=True).start()
     threading.Thread(target=udp_telemetry_sender, args=(state,), daemon=True).start()
     threading.Thread(target=axes_state_logger, args=(state,), daemon=True).start()
-    logger.info("Robot server running. Press Ctrl+C to exit.")
+    try:
+        logger.info("Robot server running. Press Ctrl+C to exit.")
+    except Exception:
+        print("Robot server running. Press Ctrl+C to exit.")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Shutting down...")
+        try:
+            logger.info("Shutting down...")
+        except Exception:
+            print("Shutting down...")
         odrv_bridge.stop()
