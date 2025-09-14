@@ -95,7 +95,7 @@ class CommandClient(threading.Thread):
 
 
 def telemetry_listener(udp_port: int, telem_queue: Queue, status_cb=None):
-    """Listen for UDP telemetry and push (t, val) into telem_queue."""
+    """Listen for UDP telemetry and push dict into telem_queue."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     # Reuse addr for quick restarts
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -105,11 +105,10 @@ def telemetry_listener(udp_port: int, telem_queue: Queue, status_cb=None):
     while True:
         try:
             data, _ = sock.recvfrom(4096)
-            # Expect JSON: {"t": <unix_time>, "val": <float>}
+            # New format: {"t": <unix_time>, "pos": [6], "vel": [6]}
+            # Legacy: {"t": <unix_time>, "val": <float>}
             telem = json.loads(data.decode("utf-8"))
-            t = float(telem.get("t", time.time()))
-            val = float(telem["val"])
-            telem_queue.put((t, val))
+            telem_queue.put(telem)
         except Exception as e:
             if status_cb:
                 status_cb(f"Telemetry error: {e}")
@@ -165,6 +164,23 @@ class RobotGUI(QWidget):
         state_layout.addWidget(self.btn_estop)
         layout.addLayout(state_layout)
 
+        # Live feedback (pos/vel) labels
+        fb_layout = QVBoxLayout()
+        self.fb_labels = []
+        for i in range(6):
+            row = QHBoxLayout()
+            lbl = QLabel(f"A{i+1} pos:")
+            val_pos = QLabel("--")
+            lbl2 = QLabel("vel:")
+            val_vel = QLabel("--")
+            row.addWidget(lbl)
+            row.addWidget(val_pos)
+            row.addWidget(lbl2)
+            row.addWidget(val_vel)
+            fb_layout.addLayout(row)
+            self.fb_labels.append((val_pos, val_vel))
+        layout.addLayout(fb_layout)
+
         # Profile controls: dropdown + send + start + rate
         prof_layout = QHBoxLayout()
         self.profile_combo = QComboBox()
@@ -203,6 +219,8 @@ class RobotGUI(QWidget):
         self.xdata = []
         self.ydata = []
         self.start_time = time.time()
+        self.last_pos = [0.0]*6
+        self.last_vel = [0.0]*6
 
         # Initialize profile dropdown (Profiles subfolder)
         self.populate_profile_dropdown()
@@ -306,8 +324,16 @@ class RobotGUI(QWidget):
             if len(self.xdata) > 200:
                 self.xdata = self.xdata[-200:]
                 self.ydata = self.ydata[-200:]
-
-            self.status_label.setText(f"Telemetry: value={val:.2f}")
+                self.status_label.setText("Telemetry: arrays (pos/vel) received")
+            # Legacy single value
+            elif "val" in telem:
+                val = float(telem["val"])
+                self.xdata.append(t - self.start_time)
+                self.ydata.append(val)
+                if len(self.xdata) > 200:
+                    self.xdata = self.xdata[-200:]
+                    self.ydata = self.ydata[-200:]
+                self.status_label.setText(f"Telemetry: value={val:.2f}")
 
         # Update plot
         self.curve.setData(self.xdata, self.ydata)
