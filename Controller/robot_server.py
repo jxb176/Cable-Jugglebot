@@ -4,35 +4,74 @@ import json
 import time
 import threading
 import random
+import os
+import logging
+from datetime import datetime
 
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
 
+# -------- ODrive CAN configuration --------
+# Adjust these for your setup
+CAN_CHANNEL = "can0"
+CAN_BITRATE = 1_000_000  # 1 Mbps
+AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]  # Node IDs for axes 1..6
+ODRIVE_COMMAND_RATE_HZ = 200.0      # Command streaming rate to drives
+
+try:
+    import odrive_can as odc  # Assumes a module providing ODrive CAN helpers
+except Exception:
+    odc = None
+
+# -------- Logging setup --------
+def _init_logging():
+    logs_dir = os.path.join(os.getcwd(), "Logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(logs_dir, f"robot_{ts}.log")
+    logger = logging.getLogger("robot")
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+
+    logger.handlers.clear()
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger, log_path
+
+logger, LOG_FILE_PATH = _init_logging()
+
+
 class RobotState:
     def __init__(self):
         self.lock = threading.Lock()
-        self.controller_ip = None  # set when TCP client connects
-        # 6-axis targets (turns) and robot state
-        self.axes = [0.0] * 6         # positions in turns
-        self.state = "disable"        # "enable" | "disable" | "estop"
-        # Profile storage and player
-        self.profile = []             # list of tuples: (t, [6 positions])
-        self.player_thread = None     # type: ProfilePlayer | None
+        self.controller_ip = None
+        self.axes = [0.0] * 6          # turns
+        self.state = "disable"         # enable|disable|estop
+        self.profile = []
+        self.player_thread = None
 
     def set_controller_ip(self, ip):
         with self.lock:
             self.controller_ip = ip
+        logger.info(f"Controller IP set to {ip}")
 
     def get_controller_ip(self):
         with self.lock:
             return self.controller_ip
 
-    # Axes and state
     def set_axes(self, positions):
         if not isinstance(positions, (list, tuple)) or len(positions) != 6:
             raise ValueError("positions must be length-6 list/tuple")
         with self.lock:
             self.axes = [float(x) for x in positions]
+        logger.info("Axes target set: " + ", ".join(f"{x:.4f}" for x in self.axes))
 
     def get_axes(self):
         with self.lock:
@@ -44,14 +83,13 @@ class RobotState:
             raise ValueError("state must be one of: enable, disable, estop")
         with self.lock:
             self.state = value
+        logger.info(f"State set to: {value}")
 
     def get_state(self) -> str:
         with self.lock:
             return self.state
 
-    # Profile management
     def set_profile(self, profile_points):
-        """profile_points: list of [t, a1..a6]"""
         if not isinstance(profile_points, (list, tuple)) or len(profile_points) == 0:
             raise ValueError("profile must be a non-empty list")
         prof = []
@@ -61,12 +99,12 @@ class RobotState:
             t = float(row[0])
             axes = [float(x) for x in row[1:7]]
             prof.append((t, axes))
-        # Ensure non-decreasing time
         times = [p[0] for p in prof]
         if any(t2 < t1 for t1, t2 in zip(times, times[1:])):
             raise ValueError("profile time column must be non-decreasing")
         with self.lock:
             self.profile = prof
+        logger.info(f"Profile uploaded: {len(prof)} points, duration {prof[-1][0]-prof[0][0]:.3f}s")
 
     def get_profile(self):
         with self.lock:
@@ -80,6 +118,7 @@ class RobotState:
         player = ProfilePlayer(self, prof, rate_hz)
         with self.lock:
             self.player_thread = player
+        logger.info(f"Profile start at {rate_hz:.1f} Hz")
         player.start()
 
     def stop_profile(self):
@@ -89,6 +128,7 @@ class RobotState:
         if player and player.is_alive():
             player.stop()
             player.join(timeout=1.0)
+            logger.info("Profile stopped")
 
 
 class ProfilePlayer(threading.Thread):
@@ -96,11 +136,10 @@ class ProfilePlayer(threading.Thread):
     def __init__(self, state: RobotState, profile, rate_hz: float):
         super().__init__(daemon=True)
         self.state = state
-        self.profile = profile  # list[(t, [6])]
+        self.profile = profile
         self.dt = 1.0 / max(1e-3, float(rate_hz))
         self._stop = threading.Event()
 
-        # Pre-normalize time to start at zero
         t0 = self.profile[0][0]
         self.norm_profile = [(t - t0, axes) for (t, axes) in self.profile]
         self.duration = self.norm_profile[-1][0]
@@ -109,53 +148,129 @@ class ProfilePlayer(threading.Thread):
         self._stop.set()
 
     def run(self):
-        print(f"[PROFILE] Starting playback at {1.0/self.dt:.1f} Hz, duration {self.duration:.3f}s")
+        logger.info(f"[PROFILE] Starting playback at {1.0/self.dt:.1f} Hz, duration {self.duration:.3f}s")
         start = time.perf_counter()
-        k = 0  # segment index: between norm_profile[k] and [k+1]
+        k = 0
         while not self._stop.is_set():
             t = time.perf_counter() - start
             if t >= self.duration:
-                # Clamp to final point and finish
                 self.state.set_axes(self.norm_profile[-1][1])
-                print("[PROFILE] Completed")
+                logger.info("[PROFILE] Completed")
                 break
-
-            # Advance segment to bracket current time
             while k + 1 < len(self.norm_profile) and self.norm_profile[k + 1][0] < t:
                 k += 1
-            # Find the two points for interpolation
             t0, p0 = self.norm_profile[k]
             t1, p1 = self.norm_profile[min(k + 1, len(self.norm_profile) - 1)]
             if t1 <= t0:
                 alpha = 0.0
             else:
-                alpha = (t - t0) / (t1 - t0)
-                if alpha < 0.0:
-                    alpha = 0.0
-                elif alpha > 1.0:
-                    alpha = 1.0
-            # Linear interpolate each axis
+                alpha = max(0.0, min(1.0, (t - t0) / (t1 - t0)))
             axes = [p0[i] + alpha * (p1[i] - p0[i]) for i in range(6)]
             self.state.set_axes(axes)
-
-            # Sleep to next tick
             time.sleep(self.dt)
-        # Clear active player reference if we are the current one
         with self.state.lock:
             if self.state.player_thread is self:
                 self.state.player_thread = None
 
 
+class ODriveCANBridge(threading.Thread):
+    """Continuously streams state and axes targets to ODrive drives over CAN."""
+    def __init__(self, state: RobotState, channel: str, bitrate: int, node_ids: list[int], rate_hz: float):
+        super().__init__(daemon=True)
+        self.state = state
+        self.channel = channel
+        self.bitrate = bitrate
+        self.node_ids = node_ids
+        self.dt = 1.0 / max(1e-3, float(rate_hz))
+        self._stop = threading.Event()
+        self._ready = False
+        self._last_state = None
+
+        self._iface = None  # odc object if available
+
+    def stop(self):
+        self._stop.set()
+
+    def _init_iface(self):
+        if odc is None:
+            logger.warning("odrive_can not available; running in simulation mode (no CAN output)")
+            return
+        try:
+            # NOTE: Adjust according to your odrive_can API.
+            # The calls below are illustrative; replace with correct constructors/methods.
+            self._iface = odc.ODriveCAN(channel=self.channel, bitrate=self.bitrate)
+            # Configure each axis for position control (turns)
+            for nid in self.node_ids:
+                try:
+                    # Example API; replace with real ones if different:
+                    # self._iface.set_state(nid, "idle")
+                    # self._iface.set_control_mode(nid, control_mode="position")
+                    pass
+                except Exception as e:
+                    logger.error(f"ODrive init failed for node {nid}: {e}")
+            self._ready = True
+            logger.info(f"ODrive CAN ready on {self.channel} @ {self.bitrate} bps")
+        except Exception as e:
+            self._iface = None
+            self._ready = False
+            logger.error(f"Failed to initialize ODrive CAN interface: {e}")
+
+    def _apply_state(self, st: str):
+        if not self._ready or self._iface is None:
+            return
+        try:
+            for nid in self.node_ids:
+                # Example API; replace with your library’s state calls
+                if st == "enable":
+                    # self._iface.set_state(nid, "closed_loop")
+                    # self._iface.set_control_mode(nid, control_mode="position")
+                    pass
+                elif st == "disable":
+                    # self._iface.set_state(nid, "idle")
+                    pass
+                elif st == "estop":
+                    # self._iface.set_state(nid, "estop")
+                    pass
+        except Exception as e:
+            logger.error(f"Failed applying state '{st}' to ODrive: {e}")
+
+    def _send_positions(self, positions_turns: list[float]):
+        if not self._ready or self._iface is None:
+            return
+        try:
+            for i, nid in enumerate(self.node_ids):
+                pos = float(positions_turns[i])
+                # Example API; replace with real method:
+                # self._iface.set_position(nid, pos_turns=pos)
+                pass
+        except Exception as e:
+            logger.error(f"Failed sending positions over ODrive CAN: {e}")
+
+    def run(self):
+        self._init_iface()
+        while not self._stop.is_set():
+            st = self.state.get_state()
+            if st != self._last_state:
+                self._apply_state(st)
+                self._last_state = st
+
+            positions = self.state.get_axes()
+            if st == "enable":
+                self._send_positions(positions)
+            # if disable/estop, no setpoints (drives are idled/estopped in _apply_state)
+
+            time.sleep(self.dt)
+
+
 def tcp_command_server(state: RobotState):
-    """Accepts a single TCP client, receives newline-delimited JSON commands."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", TCP_CMD_PORT))
     srv.listen(1)
-    print(f"[TCP] Listening on :{TCP_CMD_PORT}")
+    logger.info(f"[TCP] Listening on :{TCP_CMD_PORT}")
     while True:
         conn, addr = srv.accept()
-        print(f"[TCP] Controller connected from {addr}")
+        logger.info(f"[TCP] Controller connected from {addr}")
         state.set_controller_ip(addr[0])
         try:
             with conn, conn.makefile("r") as f:
@@ -164,40 +279,35 @@ def tcp_command_server(state: RobotState):
                         msg = json.loads(line.strip())
                         mtype = msg.get("type")
                         if mtype == "axes":
-                            positions = msg.get("positions", [])
-                            # units = msg.get("units", "turns")
                             state.set_axes(msg.get("positions", []))
                         elif mtype == "state":
                             state.set_state(msg.get("value", "disable"))
                         elif mtype == "profile_upload":
                             profile = msg.get("profile", [])
                             state.set_profile(profile)
-                            print(f"[PROFILE] Uploaded {len(state.get_profile())} points")
                         elif mtype == "profile_start":
                             rate_hz = float(msg.get("rate_hz", 100.0))
                             state.start_profile(rate_hz)
                         elif mtype == "profile_stop":
                             state.stop_profile()
-                            print("[PROFILE] Stopped")
                         else:
-                            print("[TCP] Unknown command type:", mtype)
+                            logger.warning(f"[TCP] Unknown command type: {mtype}")
                     except Exception as e:
-                        print("[TCP] Bad command:", e)
+                        logger.error(f"[TCP] Bad command: {e}")
         except Exception as e:
-            print("[TCP] Connection error:", e)
+            logger.error(f"[TCP] Connection error: {e}")
         finally:
             state.stop_profile()
-            print("[TCP] Controller disconnected")
+            logger.info("[TCP] Controller disconnected")
+
 
 def udp_telemetry_sender(state: RobotState):
-    """Sends telemetry to the controller IP over UDP at 10 Hz."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while True:
         time.sleep(0.1)
         ctrl_ip = state.get_controller_ip()
         if not ctrl_ip:
             continue
-        # Example telemetry: derive a single value from axis 1 plus small noise
         axes = state.get_axes()
         a1 = axes[0] if axes else 0.0
         val = a1 + random.uniform(-0.05, 0.05)
@@ -205,25 +315,41 @@ def udp_telemetry_sender(state: RobotState):
         try:
             sock.sendto(json.dumps(msg).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
         except Exception as e:
-            print("[UDP] Telemetry send error:", e)
+            logger.error(f"[UDP] Telemetry send error: {e}")
+
 
 def axes_state_logger(state: RobotState):
-    """Prints current robot state and 6-axis targets at 1 Hz."""
     while True:
         try:
             axes = state.get_axes()
             st = state.get_state()
-            print(f"[LOG] State={st} Axes(turns)=[" +
-                  ", ".join(f"{x:.3f}" for x in axes) + "]")
+            logger.info(f"[LOG] State={st} Axes(turns)=[" +
+                        ", ".join(f"{x:.3f}" for x in axes) + "]")
         except Exception as e:
-            print(f"[LOG] Error reading state/axes: {e}")
+            logger.error(f"[LOG] Error reading state/axes: {e}")
         time.sleep(1.0)
+
 
 if __name__ == "__main__":
     state = RobotState()
+
+    # ODrive CAN bridge
+    odrv_bridge = ODriveCANBridge(
+        state=state,
+        channel=CAN_CHANNEL,
+        bitrate=CAN_BITRATE,
+        node_ids=AXIS_NODE_IDS,
+        rate_hz=ODRIVE_COMMAND_RATE_HZ,
+    )
+    odrv_bridge.start()
+
     threading.Thread(target=tcp_command_server, args=(state,), daemon=True).start()
     threading.Thread(target=udp_telemetry_sender, args=(state,), daemon=True).start()
     threading.Thread(target=axes_state_logger, args=(state,), daemon=True).start()
-    print("Robot server running. Press Ctrl+C to exit.")
-    while True:
-        time.sleep(1)
+    logger.info("Robot server running. Press Ctrl+C to exit.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        odrv_bridge.stop()
