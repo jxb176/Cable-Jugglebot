@@ -196,20 +196,48 @@ class ODriveCANBridge(threading.Thread):
             logger.warning("odrive_can not available; running in simulation mode (no CAN output)")
             return
         try:
-            # NOTE: Adjust according to your odrive_can API.
-            # The calls below are illustrative; replace with correct constructors/methods.
-            self._iface = odc.ODriveCAN(channel=self.channel, bitrate=self.bitrate)
-            # Configure each axis for position control (turns)
+            import inspect
+            ctor = getattr(odc, "ODriveCAN", None)
+            if ctor is None:
+                raise RuntimeError("odrive_can.ODriveCAN not found")
+
+            # Try a set of likely constructor signatures
+            attempts = [
+                ("positional (channel, bitrate)", lambda: ctor(self.channel, self.bitrate)),
+                ("kw channel+bitrate",           lambda: ctor(channel=self.channel, bitrate=self.bitrate)),
+                ("kw interface+channel",         lambda: ctor(interface="socketcan", channel=self.channel)),
+                ("positional (channel)",         lambda: ctor(self.channel)),
+                ("no-arg",                       lambda: ctor()),
+            ]
+
+            last_err = None
+            for label, factory in attempts:
+                try:
+                    self._iface = factory()
+                    logger.info(f"ODrive CAN created using ctor: {label}")
+                    break
+                except TypeError as e:
+                    last_err = e
+                    continue
+                except Exception as e:
+                    last_err = e
+                    continue
+
+            if self._iface is None:
+                raise RuntimeError(f"Failed to construct ODriveCAN with known signatures: {last_err}")
+
+            # Configure each axis for position control (turns) if your API requires it
             for nid in self.node_ids:
                 try:
-                    # Example API; replace with real ones if different:
+                    # Replace these with real odrive_can calls if needed, e.g.:
                     # self._iface.set_state(nid, "idle")
                     # self._iface.set_control_mode(nid, control_mode="position")
                     pass
                 except Exception as e:
                     logger.error(f"ODrive init failed for node {nid}: {e}")
+
             self._ready = True
-            logger.info(f"ODrive CAN ready on {self.channel} @ {self.bitrate} bps")
+            logger.info(f"ODrive CAN ready on {self.channel} (bitrate {self.bitrate})")
         except Exception as e:
             self._iface = None
             self._ready = False
