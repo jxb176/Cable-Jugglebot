@@ -17,8 +17,8 @@ UDP_TELEM_PORT = 5556
 # -------- ODrive CAN configuration --------
 ODRIVE_INTERFACE = "can0"            # e.g., "can0" or "vcan0"
 ODRIVE_BITRATE = 1_000_000           # 1 Mbps
-#AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]
-AXIS_NODE_IDS = [0]
+AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]
+#AXIS_NODE_IDS = [0]
 ODRIVE_COMMAND_RATE_HZ = 200.0
 ODRIVE_LOG_RATE_HZ = 2.0
 # Ensure env var for libraries that require CAN_CHANNEL
