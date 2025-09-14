@@ -633,34 +633,30 @@ if __name__ == "__main__":
         traceback.print_exception(exc_type, exc, tb)
     sys.excepthook = _excepthook
 
-    # Create Qt app first
+    # 1) Create Qt app
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
-    # Queues
+    # 2) Prepare queues
     cmd_queue = Queue(maxsize=1)
     telem_queue = Queue()
 
-    # Build and show GUI immediately
+    # 3) Build and show GUI immediately
     gui = RobotGUI(cmd_queue, telem_queue)
     gui.status_label.setText("Starting GUI...")
     gui.show()
     gui.raise_()
     gui.activateWindow()
-    print("[GUI] Window shown")
+    print("[GUI] Window shown request sent")
 
-    # Periodic “alive” indicator
-    def _alive_tick():
-        # Update the title subtly so you can see it refreshing
-        gui.setWindowTitle(f"Robot Controller + Telemetry  (alive {int(time.time())})")
-        print("[GUI] alive", time.strftime("%H:%M:%S"))
-    alive_timer = QTimer()
-    alive_timer.timeout.connect(_alive_tick)
-    alive_timer.start(2000)  # every 2s
+    # 4) After event loop starts, ensure it’s on top
+    def _raise_again():
+        gui.raise_()
+        gui.activateWindow()
+        print("[GUI] Window raised/activated")
+    QTimer.singleShot(100, _raise_again)
 
-    # Start background threads AFTER the event loop starts
-    _threads = {}
-
+    # 5) Start background threads AFTER GUI is up
     def _start_background():
         print("[BG] Starting background threads")
         # Telemetry listener (UDP)
@@ -670,7 +666,6 @@ if __name__ == "__main__":
             daemon=True,
         )
         telem_thread.start()
-        _threads["telem_thread"] = telem_thread
 
         # TCP command client
         cmd_client = CommandClient(
@@ -678,24 +673,24 @@ if __name__ == "__main__":
         )
         cmd_client.daemon = True
         cmd_client.start()
-        _threads["cmd_client"] = cmd_client
 
         gui.status_label.setText("Ready")
         print("[BG] Threads started")
 
     QTimer.singleShot(0, _start_background)
 
-    # Graceful shutdown
-    def _on_quit():
-        print("[QUIT] Stopping background threads")
-        client = _threads.get("cmd_client")
-        if client:
-            try:
-                client.stop()
-            except Exception:
-                pass
-        # telem_thread is daemon; no join needed
-    app.aboutToQuit.connect(_on_quit)
+    # 6) Watchdog: verify window visibility once per second for 5s
+    checks = {"count": 0}
+    def _visibility_watchdog():
+        checks["count"] += 1
+        vis = gui.isVisible()
+        geo = gui.geometry()
+        print(f"[WATCHDOG] visible={vis} pos=({geo.x()},{geo.y()}) size=({geo.width()}x{geo.height()})")
+        if checks["count"] >= 5 or vis:
+            return  # stop after first visible or 5 checks
+        QTimer.singleShot(1000, _visibility_watchdog)
+    QTimer.singleShot(500, _visibility_watchdog)
 
+    # 7) Enter event loop
     print("[GUI] Entering event loop")
     sys.exit(app.exec())
