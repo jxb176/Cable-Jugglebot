@@ -15,7 +15,7 @@ UDP_TELEM_PORT = 5556
 # Adjust these for your setup
 CAN_CHANNEL = "can0"
 CAN_BITRATE = 1_000_000  # 1 Mbps
-AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]  # Node IDs for axes 1..6
+AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]  # Node IDs for axes 1..6 (using 0..5 now)
 ODRIVE_COMMAND_RATE_HZ = 200.0      # Command streaming rate to drives
 
 try:
