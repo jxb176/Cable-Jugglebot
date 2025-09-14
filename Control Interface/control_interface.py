@@ -219,6 +219,44 @@ class RobotGUI(QWidget):
         os.makedirs(pdir, exist_ok=True)
         return pdir
 
+    def send_axes(self, *_):
+        """Send 6-axis position command in turns."""
+        positions = [float(sp.value()) for sp in self.axis_spins]
+        cmd = {"type": "axes", "positions": positions, "units": "turns"}
+        _queue_put_latest(self.cmd_queue, cmd)
+
+    def send_state(self, state_value: str):
+        """Send robot state command."""
+        cmd = {"type": "state", "value": state_value}
+        _queue_put_latest(self.cmd_queue, cmd)
+
+    def _load_csv_as_profile(self, path: str):
+        """Load CSV profile with rows: time, axis1..axis6."""
+        rows = []
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            rows = [r for r in reader if any(cell.strip() for cell in r)]
+        if not rows:
+            raise ValueError("empty CSV")
+        # Skip header if first cell not numeric
+        start_idx = 0
+        try:
+            float(rows[0][0])
+        except Exception:
+            start_idx = 1
+        profile_rows = []
+        for r in rows[start_idx:]:
+            if len(r) < 7:
+                raise ValueError("each row must have at least 7 columns: time + 6 axes")
+            t = float(r[0])
+            axes = [float(x) for x in r[1:7]]
+            profile_rows.append([t] + axes)
+        # Ensure monotonic non-decreasing time
+        times = [row[0] for row in profile_rows]
+        if any(t2 < t1 for t1, t2 in zip(times, times[1:])):
+            raise ValueError("time column must be non-decreasing")
+        return profile_rows
+
     def populate_profile_dropdown(self):
         """Scan Profiles subdirectory for CSV files and populate the dropdown."""
         pdir = self._profiles_dir()
@@ -263,15 +301,11 @@ class RobotGUI(QWidget):
             t, val = self.telem_queue.get()
             self.xdata.append(t - self.start_time)
             self.ydata.append(val)
-
             # Limit buffer size
             if len(self.xdata) > 200:
                 self.xdata = self.xdata[-200:]
                 self.ydata = self.ydata[-200:]
-
             self.status_label.setText(f"Telemetry: value={val:.2f}")
-
-        # Update plot
         self.curve.setData(self.xdata, self.ydata)
 
 
