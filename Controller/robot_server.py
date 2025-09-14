@@ -7,16 +7,17 @@ import random
 import os
 import logging
 from datetime import datetime
+import subprocess
 
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
 
 # -------- ODrive CAN configuration --------
-# Adjust these for your setup
 ODRIVE_INTERFACE = "can0"            # e.g., "can0" or "vcan0"
-AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]   # Node IDs for axes 1..6
-ODRIVE_COMMAND_RATE_HZ = 200.0       # Rate to stream setpoints to drives
-ODRIVE_LOG_RATE_HZ = 2.0             # How often to print feedback summaries
+ODRIVE_BITRATE = 1_000_000           # 1 Mbps
+AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]
+ODRIVE_COMMAND_RATE_HZ = 200.0
+ODRIVE_LOG_RATE_HZ = 2.0
 
 try:
     import odrive_can as odc  # Assumes a module providing ODrive CAN helpers
@@ -46,6 +47,74 @@ def _init_logging():
     return logger, log_path
 
 logger, LOG_FILE_PATH = _init_logging()
+
+def ensure_can_interface_up(ifname: str, bitrate: int) -> bool:
+    """Ensure CAN interface is up with a given bitrate. Returns True if up."""
+    try:
+        # Check current status
+        res = subprocess.run(
+            ["ip", "link", "show", ifname],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+        )
+        if res.returncode == 0:
+            out = res.stdout.lower()
+            if " state up " in out or "<up," in out or "up>" in out:
+                logger.info(f"[CAN] Interface {ifname} already UP")
+                return True
+        else:
+            logger.warning(f"[CAN] '{ifname}' not found or not available: {res.stderr.strip()}")
+
+        logger.info(f"[CAN] Bringing up {ifname} @ {bitrate} bps")
+        # Bring down (ignore errors)
+        subprocess.run(["ip", "link", "set", ifname, "down"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Configure type/bitrate
+        cfg = subprocess.run(
+            ["ip", "link", "set", ifname, "type", "can", "bitrate", str(bitrate)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3,
+        )
+        if cfg.returncode != 0:
+            logger.error(f"[CAN] Failed to configure {ifname}: {cfg.stderr.strip()}")
+            return False
+        # Bring up
+        up = subprocess.run(
+            ["ip", "link", "set", ifname, "up"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=3,
+        )
+        if up.returncode != 0:
+            logger.error(f"[CAN] Failed to bring {ifname} up: {up.stderr.strip()}")
+            return False
+
+        # Verify
+        ver = subprocess.run(
+            ["ip", "link", "show", ifname],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+        )
+        if ver.returncode == 0 and (" state up " in ver.stdout.lower() or "<up," in ver.stdout.lower() or "up>" in ver.stdout.lower()):
+            logger.info(f"[CAN] {ifname} is UP")
+            return True
+        logger.error(f"[CAN] {ifname} did not come UP; status: {ver.stdout.strip()}")
+        return False
+    except FileNotFoundError:
+        logger.error("[CAN] 'ip' command not found. Install iproute2 or run on a system with 'ip'.")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error(f"[CAN] Timeout while configuring {ifname}")
+        return False
+    except Exception as e:
+        logger.error(f"[CAN] Unexpected error: {e}")
+        return False
 
 
 class RobotState:
@@ -355,9 +424,15 @@ def axes_state_logger(state: RobotState):
 if __name__ == "__main__":
     state = RobotState()
 
+    # Ensure CAN interface is up before starting ODrive bridge
+    can_ok = ensure_can_interface_up(ODRIVE_INTERFACE, ODRIVE_BITRATE)
+    if not can_ok:
+        logger.warning(f"[CAN] Continuing without {ODRIVE_INTERFACE} being UP (ODrive bridge may run in simulation or fail)")
+
     # Start ODrive CAN bridge (async driver + feedback logging)
     odrv_bridge = ODriveCANBridge(state)
     odrv_bridge.start()
+
     threading.Thread(target=tcp_command_server, args=(state,), daemon=True).start()
     threading.Thread(target=udp_telemetry_sender, args=(state,), daemon=True).start()
     threading.Thread(target=axes_state_logger, args=(state,), daemon=True).start()
