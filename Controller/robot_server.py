@@ -491,11 +491,15 @@ def udp_telemetry_sender(state: RobotState):
         ctrl_ip = state.get_controller_ip()
         if not ctrl_ip:
             continue
-        axes = state.get_axes()
-        a1 = axes[0] if axes else 0.0
-        # write random value
-        val = a1 + random.uniform(-0.05, 0.05)
-        msg = {"t": time.time(), "val": float(val)}
+        # Transmit measured position feedback (axes_pos_estimate) instead of fake value
+        fb_pos, _fb_vel = state.get_feedback()
+        # fb_pos may contain None entries if not yet populated
+        if not isinstance(fb_pos, list) or len(fb_pos) != 6:
+            continue  # wait until we have a full array
+        msg = {
+            "t": time.time(),
+            "pos": [None if v is None else float(v) for v in fb_pos],
+        }
         try:
             sock.sendto(json.dumps(msg).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
         except Exception as e:
