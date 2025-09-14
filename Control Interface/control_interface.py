@@ -5,10 +5,12 @@ import random
 from queue import Queue
 import socket
 import json
+import os
+import csv
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
-    QLabel, QSlider, QHBoxLayout, QDoubleSpinBox
+    QLabel, QSlider, QHBoxLayout, QDoubleSpinBox, QComboBox
 )
 from PyQt6.QtCore import Qt, QTimer
 
@@ -163,10 +165,28 @@ class RobotGUI(QWidget):
         state_layout.addWidget(self.btn_estop)
         layout.addLayout(state_layout)
 
-        # Stop button
-        self.stop_btn = QPushButton("STOP")
-        self.stop_btn.clicked.connect(lambda: self.send_state("estop"))
-        layout.addWidget(self.stop_btn)
+        # Profile controls: dropdown + send + start + rate
+        prof_layout = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        self.profile_refresh_btn = QPushButton("Refresh")
+        self.profile_send_btn = QPushButton("Send Profile")
+        self.profile_rate = QDoubleSpinBox()
+        self.profile_rate.setDecimals(1)
+        self.profile_rate.setRange(1.0, 1000.0)
+        self.profile_rate.setSingleStep(10.0)
+        self.profile_rate.setValue(100.0)
+        self.profile_start_btn = QPushButton("Start Profile")
+        self.profile_refresh_btn.clicked.connect(self.populate_profile_dropdown)
+        self.profile_send_btn.clicked.connect(self.on_send_profile)
+        self.profile_start_btn.clicked.connect(self.on_start_profile)
+        prof_layout.addWidget(QLabel("Profile CSV:"))
+        prof_layout.addWidget(self.profile_combo, 1)
+        prof_layout.addWidget(self.profile_refresh_btn)
+        prof_layout.addWidget(self.profile_send_btn)
+        prof_layout.addWidget(QLabel("Rate (Hz):"))
+        prof_layout.addWidget(self.profile_rate)
+        prof_layout.addWidget(self.profile_start_btn)
+        layout.addLayout(prof_layout)
 
         # --- Telemetry plot ---
         self.plot = pg.PlotWidget(title="Telemetry Data (Sensor Value)")
@@ -183,6 +203,9 @@ class RobotGUI(QWidget):
         self.xdata = []
         self.ydata = []
         self.start_time = time.time()
+
+        # Initialize profile dropdown
+        self.populate_profile_dropdown()
 
         # Timer to refresh GUI
         self.timer = QTimer()
@@ -205,6 +228,73 @@ class RobotGUI(QWidget):
         # No-op or translate if needed. Here we just ignore non-dict to avoid speed usage.
         if isinstance(value, dict):
             _queue_put_latest(self.cmd_queue, value)
+
+    def populate_profile_dropdown(self):
+        """Scan current directory for CSV files and populate the dropdown."""
+        cwd = os.getcwd()
+        csvs = sorted([f for f in os.listdir(cwd) if f.lower().endswith(".csv")])
+        self.profile_combo.clear()
+        if not csvs:
+            self.profile_combo.addItem("(no .csv files found)")
+            self.profile_combo.setEnabled(False)
+        else:
+            self.profile_combo.setEnabled(True)
+            for f in csvs:
+                self.profile_combo.addItem(f)
+
+    def _load_csv_as_profile(self, path):
+        """Load CSV: rows -> [t, a1..a6]. Returns a list of lists."""
+        profile_rows = []
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            rows = [r for r in reader if any(cell.strip() for cell in r)]
+        if not rows:
+            raise ValueError("empty CSV")
+
+        # Skip header if first cell not numeric
+        start_idx = 0
+        try:
+            float(rows[0][0])
+        except Exception:
+            start_idx = 1
+
+        for r in rows[start_idx:]:
+            if len(r) < 7:
+                raise ValueError("each row must have at least 7 columns: time + 6 axes")
+            t = float(r[0])
+            axes = [float(x) for x in r[1:7]]
+            profile_rows.append([t] + axes)
+
+        # Ensure monotonic non-decreasing time
+        times = [row[0] for row in profile_rows]
+        if any(t2 < t1 for t1, t2 in zip(times, times[1:])):
+            raise ValueError("time column must be non-decreasing")
+        return profile_rows
+
+    def on_send_profile(self):
+        """Parse selected CSV and send it to the robot server."""
+        if not self.profile_combo.isEnabled():
+            self.status_label.setText("No CSV profile to send")
+            return
+        fname = self.profile_combo.currentText()
+        if not fname or fname.startswith("("):
+            self.status_label.setText("Select a valid CSV profile")
+            return
+        path = os.path.join(os.getcwd(), fname)
+        try:
+            profile_rows = self._load_csv_as_profile(path)
+            cmd = {"type": "profile_upload", "profile": profile_rows}
+            _queue_put_latest(self.cmd_queue, cmd)
+            self.status_label.setText(f"Sent profile: {fname} ({len(profile_rows)} pts)")
+        except Exception as e:
+            self.status_label.setText(f"Profile send failed: {e}")
+
+    def on_start_profile(self):
+        """Send a profile_start with selected rate."""
+        rate = float(self.profile_rate.value())
+        cmd = {"type": "profile_start", "rate_hz": rate}
+        _queue_put_latest(self.cmd_queue, cmd)
+        self.status_label.setText(f"Profile start requested at {rate:.1f} Hz")
 
     def update_gui(self):
         """Check telemetry and update GUI."""
