@@ -13,10 +13,10 @@ UDP_TELEM_PORT = 5556
 
 # -------- ODrive CAN configuration --------
 # Adjust these for your setup
-CAN_CHANNEL = "can0"
-CAN_BITRATE = 1_000_000  # 1 Mbps
-AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]  # Node IDs for axes 1..6 (using 0..5 now)
-ODRIVE_COMMAND_RATE_HZ = 200.0      # Command streaming rate to drives
+ODRIVE_INTERFACE = "can0"            # e.g., "can0" or "vcan0"
+AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]   # Node IDs for axes 1..6
+ODRIVE_COMMAND_RATE_HZ = 200.0       # Rate to stream setpoints to drives
+ODRIVE_LOG_RATE_HZ = 2.0             # How often to print feedback summaries
 
 try:
     import odrive_can as odc  # Assumes a module providing ODrive CAN helpers
@@ -133,16 +133,6 @@ class RobotState:
 
 class ProfilePlayer(threading.Thread):
     """Plays a time-position profile with linear interpolation at fixed rate."""
-    def __init__(self, state: RobotState, profile, rate_hz: float):
-        super().__init__(daemon=True)
-        self.state = state
-        self.profile = profile
-        self.dt = 1.0 / max(1e-3, float(rate_hz))
-        self._stop = threading.Event()
-
-        t0 = self.profile[0][0]
-        self.norm_profile = [(t - t0, axes) for (t, axes) in self.profile]
-        self.duration = self.norm_profile[-1][0]
 
     def stop(self):
         self._stop.set()
@@ -174,120 +164,124 @@ class ProfilePlayer(threading.Thread):
 
 
 class ODriveCANBridge(threading.Thread):
-    """Continuously streams state and axes targets to ODrive drives over CAN."""
-    def __init__(self, state: RobotState, channel: str, bitrate: int, node_ids: list[int], rate_hz: float):
+    """Streams axes targets to ODrive over CAN (async) and logs feedback callbacks."""
+    def __init__(self, state: RobotState):
         super().__init__(daemon=True)
         self.state = state
-        self.channel = channel
-        self.bitrate = bitrate
-        self.node_ids = node_ids
-        self.dt = 1.0 / max(1e-3, float(rate_hz))
         self._stop = threading.Event()
-        self._ready = False
+        self._drivers = []              # list[(axis_id, drv)]
         self._last_state = None
-
-        self._iface = None  # odc object if available
+        self._last_log = 0.0
+        self._feedback_seen = {aid: 0 for aid in AXIS_NODE_IDS}
 
     def stop(self):
         self._stop.set()
 
-    def _init_iface(self):
+    def _feedback_cb(self, axis_id: int):
+        def _cb(msg, caller):
+            # Print the raw feedback message as in the example
+            print(f"[ODRV] axis={axis_id} feedback: {msg}")
+            # Track we received feedback for this axis
+            self._feedback_seen[axis_id] = self._feedback_seen.get(axis_id, 0) + 1
+        return _cb
+
+    async def _start_all(self):
+        """Create and start ODriveCAN instances for all node IDs."""
         if odc is None:
-            logger.warning("odrive_can not available; running in simulation mode (no CAN output)")
+            logger.warning("odrive_can not available; running in simulation mode (no CAN I/O)")
+            return
+
+        for aid in AXIS_NODE_IDS:
+            try:
+                drv = odc.ODriveCAN(axis_id=aid, interface=ODRIVE_INTERFACE)
+                drv.feedback_callback = self._feedback_cb(aid)
+                await drv.start()
+                # Optional: configure controller mode for position control (per your example)
+                drv.check_errors()
+                drv.set_controller_mode("POSITION_CONTROL", "POS_FILTER")
+                drv.set_linear_count(0)
+                self._drivers.append((aid, drv))
+                logger.info(f"ODrive axis {aid} started on {ODRIVE_INTERFACE}")
+            except Exception as e:
+                logger.error(f"Failed to init ODrive axis {aid}: {e}")
+
+    async def _apply_state(self, st: str):
+        """Apply state across all axes."""
+        if not self._drivers:
             return
         try:
-            import inspect
-            ctor = getattr(odc, "ODriveCAN", None)
-            if ctor is None:
-                raise RuntimeError("odrive_can.ODriveCAN not found")
-
-            # Try a set of likely constructor signatures
-            attempts = [
-                ("positional (channel, bitrate)", lambda: ctor(self.channel, self.bitrate)),
-                ("kw channel+bitrate",           lambda: ctor(channel=self.channel, bitrate=self.bitrate)),
-                ("kw interface+channel",         lambda: ctor(interface="socketcan", channel=self.channel)),
-                ("positional (channel)",         lambda: ctor(self.channel)),
-                ("no-arg",                       lambda: ctor()),
-            ]
-
-            last_err = None
-            for label, factory in attempts:
-                try:
-                    self._iface = factory()
-                    logger.info(f"ODrive CAN created using ctor: {label}")
-                    break
-                except TypeError as e:
-                    last_err = e
-                    continue
-                except Exception as e:
-                    last_err = e
-                    continue
-
-            if self._iface is None:
-                raise RuntimeError(f"Failed to construct ODriveCAN with known signatures: {last_err}")
-
-            # Configure each axis for position control (turns) if your API requires it
-            for nid in self.node_ids:
-                try:
-                    # Replace these with real odrive_can calls if needed, e.g.:
-                    # self._iface.set_state(nid, "idle")
-                    # self._iface.set_control_mode(nid, control_mode="position")
-                    pass
-                except Exception as e:
-                    logger.error(f"ODrive init failed for node {nid}: {e}")
-
-            self._ready = True
-            logger.info(f"ODrive CAN ready on {self.channel} (bitrate {self.bitrate})")
-        except Exception as e:
-            self._iface = None
-            self._ready = False
-            logger.error(f"Failed to initialize ODrive CAN interface: {e}")
-
-    def _apply_state(self, st: str):
-        if not self._ready or self._iface is None:
-            return
-        try:
-            for nid in self.node_ids:
-                # Example API; replace with your library’s state calls
-                if st == "enable":
-                    # self._iface.set_state(nid, "closed_loop")
-                    # self._iface.set_control_mode(nid, control_mode="position")
-                    pass
-                elif st == "disable":
-                    # self._iface.set_state(nid, "idle")
-                    pass
-                elif st == "estop":
-                    # self._iface.set_state(nid, "estop")
-                    pass
+            if st == "enable":
+                # Enter closed loop control on all axes
+                for aid, drv in self._drivers:
+                    await drv.set_axis_state("CLOSED_LOOP_CONTROL")
+            elif st == "disable":
+                for aid, drv in self._drivers:
+                    await drv.set_axis_state("IDLE")
+            elif st == "estop":
+                # If your API supports a hard stop/estop, call it; otherwise go to IDLE
+                for aid, drv in self._drivers:
+                    try:
+                        await drv.set_axis_state("IDLE")
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error(f"Failed applying state '{st}' to ODrive: {e}")
 
-    def _send_positions(self, positions_turns: list[float]):
-        if not self._ready or self._iface is None:
-            return
-        try:
-            for i, nid in enumerate(self.node_ids):
-                pos = float(positions_turns[i])
-                # Example API; replace with real method:
-                # self._iface.set_position(nid, pos_turns=pos)
-                pass
-        except Exception as e:
-            logger.error(f"Failed sending positions over ODrive CAN: {e}")
+    async def _stream_positions(self):
+        """Main async loop: stream setpoints and periodically log feedback counts."""
+        dt_cmd = 1.0 / max(1e-3, ODRIVE_COMMAND_RATE_HZ)
+        dt_log = 1.0 / max(1e-3, ODRIVE_LOG_RATE_HZ)
+        t0 = time.perf_counter()
+        last_cmd = t0
+        last_log = t0
 
-    def run(self):
-        self._init_iface()
         while not self._stop.is_set():
+            now = time.perf_counter()
             st = self.state.get_state()
+
+            # Apply state transition if changed
             if st != self._last_state:
-                self._apply_state(st)
+                await self._apply_state(st)
                 self._last_state = st
 
-            positions = self.state.get_axes()
-            if st == "enable":
-                self._send_positions(positions)
-            # if disable/estop, no setpoints (drives are idled/estopped in _apply_state)
+            # Send positions when enabled
+            if self._drivers and st == "enable" and (now - last_cmd) >= dt_cmd:
+                positions = self.state.get_axes()
+                for i, (aid, drv) in enumerate(self._drivers):
+                    try:
+                        drv.set_input_pos(float(positions[i]))
+                    except Exception as e:
+                        logger.error(f"Axis {aid} set_input_pos failed: {e}")
+                last_cmd = now
 
-            time.sleep(self.dt)
+            # Periodic summary of feedback received
+            if (now - last_log) >= dt_log:
+                summary = ", ".join(f"{aid}:{self._feedback_seen.get(aid,0)}"
+                                    for aid, _ in self._drivers)
+                logger.info(f"[ODRV] feedback counts: {summary if summary else 'no drivers'}")
+                last_log = now
+
+            # Sleep a small slice to keep loop responsive
+            await asyncio.sleep(0.002)
+
+    async def _run_async(self):
+        await self._start_all()
+        await self._apply_state(self.state.get_state())
+        await self._stream_positions()
+
+    def run(self):
+        if odc is None:
+            # Simulation mode: just idle loop with logs
+            logger.warning("ODrive bridge running in simulation mode (odrive_can missing)")
+            while not self._stop.is_set():
+                time.sleep(0.5)
+            return
+
+        try:
+            import asyncio
+            asyncio.run(self._run_async())
+        except Exception as e:
+            logger.error(f"ODrive asyncio loop error: {e}")
 
 
 def tcp_command_server(state: RobotState):
@@ -361,16 +355,9 @@ def axes_state_logger(state: RobotState):
 if __name__ == "__main__":
     state = RobotState()
 
-    # ODrive CAN bridge
-    odrv_bridge = ODriveCANBridge(
-        state=state,
-        channel=CAN_CHANNEL,
-        bitrate=CAN_BITRATE,
-        node_ids=AXIS_NODE_IDS,
-        rate_hz=ODRIVE_COMMAND_RATE_HZ,
-    )
+    # Start ODrive CAN bridge (async driver + feedback logging)
+    odrv_bridge = ODriveCANBridge(state)
     odrv_bridge.start()
-
     threading.Thread(target=tcp_command_server, args=(state,), daemon=True).start()
     threading.Thread(target=udp_telemetry_sender, args=(state,), daemon=True).start()
     threading.Thread(target=axes_state_logger, args=(state,), daemon=True).start()
