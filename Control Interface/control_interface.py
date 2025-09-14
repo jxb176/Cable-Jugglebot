@@ -281,6 +281,7 @@ from PyQt6.QtWidgets import (
     QLabel, QSlider, QHBoxLayout, QDoubleSpinBox, QComboBox
 )
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QGuiApplication
 
 import pyqtgraph as pg
 
@@ -506,6 +507,17 @@ class RobotGUI(QWidget):
 
         self.setLayout(layout)
 
+        # Force-center on primary screen to avoid off-screen window
+        try:
+            screen = QGuiApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                frame = self.frameGeometry()
+                frame.moveCenter(avail.center())
+                self.move(frame.topLeft())
+        except Exception:
+            pass
+
         # Data buffer
         self.xdata = []
         self.ydata = []
@@ -627,70 +639,39 @@ class RobotGUI(QWidget):
 #     ...
 
 if __name__ == "__main__":
-    # Ensure unhandled exceptions surface in terminal
+    # Print any uncaught exceptions to terminal
     def _excepthook(exc_type, exc, tb):
         import traceback
         traceback.print_exception(exc_type, exc, tb)
     sys.excepthook = _excepthook
 
-    # 1) Create Qt app
+    print("[MAIN] Launching control interface GUI")
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
-    # 2) Prepare queues
     cmd_queue = Queue(maxsize=1)
     telem_queue = Queue()
 
-    # 3) Build and show GUI immediately
     gui = RobotGUI(cmd_queue, telem_queue)
     gui.status_label.setText("Starting GUI...")
     gui.show()
     gui.raise_()
     gui.activateWindow()
-    print("[GUI] Window shown request sent")
+    print("[MAIN] GUI shown, starting background threads")
 
-    # 4) After event loop starts, ensure it’s on top
-    def _raise_again():
-        gui.raise_()
-        gui.activateWindow()
-        print("[GUI] Window raised/activated")
-    QTimer.singleShot(100, _raise_again)
+    # Start background threads AFTER the GUI is visible
+    telem_thread = threading.Thread(
+        target=telemetry_listener,
+        args=(UDP_TELEM_PORT, telem_queue, lambda s: print("[TELEM]", s)),
+        daemon=True,
+    )
+    telem_thread.start()
 
-    # 5) Start background threads AFTER GUI is up
-    def _start_background():
-        print("[BG] Starting background threads")
-        # Telemetry listener (UDP)
-        telem_thread = threading.Thread(
-            target=telemetry_listener,
-            args=(UDP_TELEM_PORT, telem_queue, lambda s: print("[TELEM]", s)),
-            daemon=True,
-        )
-        telem_thread.start()
+    cmd_client = CommandClient(
+        ROBOT_HOST, TCP_CMD_PORT, cmd_queue, status_cb=lambda s: print("[TCP]", s)
+    )
+    cmd_client.daemon = True
+    cmd_client.start()
 
-        # TCP command client
-        cmd_client = CommandClient(
-            ROBOT_HOST, TCP_CMD_PORT, cmd_queue, status_cb=lambda s: print("[TCP]", s)
-        )
-        cmd_client.daemon = True
-        cmd_client.start()
-
-        gui.status_label.setText("Ready")
-        print("[BG] Threads started")
-
-    QTimer.singleShot(0, _start_background)
-
-    # 6) Watchdog: verify window visibility once per second for 5s
-    checks = {"count": 0}
-    def _visibility_watchdog():
-        checks["count"] += 1
-        vis = gui.isVisible()
-        geo = gui.geometry()
-        print(f"[WATCHDOG] visible={vis} pos=({geo.x()},{geo.y()}) size=({geo.width()}x{geo.height()})")
-        if checks["count"] >= 5 or vis:
-            return  # stop after first visible or 5 checks
-        QTimer.singleShot(1000, _visibility_watchdog)
-    QTimer.singleShot(500, _visibility_watchdog)
-
-    # 7) Enter event loop
-    print("[GUI] Entering event loop")
+    print("[MAIN] Entering Qt event loop")
     sys.exit(app.exec())
