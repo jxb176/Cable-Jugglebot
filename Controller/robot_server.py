@@ -1,376 +1,342 @@
-# robot_server.py
+import sys
+import threading
+import time
+import random
+from queue import Queue
 import socket
 import json
-import time
-import threading
-import random
 import os
-import logging
-from datetime import datetime
-import subprocess
-import asyncio  # <-- make asyncio available at module scope
+import csv
 
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QPushButton,
+    QLabel, QSlider, QHBoxLayout, QDoubleSpinBox, QComboBox
+)
+from PyQt6.QtCore import Qt, QTimer
+
+import pyqtgraph as pg
+
+
+# Networking configuration
+ROBOT_HOST = "jugglepi.local"  # <-- set to your Raspberry Pi IP or hostname
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
 
-# -------- ODrive CAN configuration --------
-ODRIVE_INTERFACE = "can0"            # e.g., "can0" or "vcan0"
-ODRIVE_BITRATE = 1_000_000           # 1 Mbps
-#AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]
-AXIS_NODE_IDS = [0]
-ODRIVE_COMMAND_RATE_HZ = 200.0
-ODRIVE_LOG_RATE_HZ = 2.0
-# Ensure env var for libraries that require CAN_CHANNEL
-os.environ.setdefault("CAN_CHANNEL", ODRIVE_INTERFACE)
-os.environ.setdefault("CAN_BITRATE", str(ODRIVE_BITRATE))
 
-try:
-    import odrive_can as odc
-except Exception:
-    odc = None
-
-# -------- Logging setup --------
-def _init_logging():
-    logs_dir = os.path.join(os.getcwd(), "Logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(logs_dir, f"robot_{ts}.log")
-    logger = logging.getLogger("robot")
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(fmt)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-
-    logger.handlers.clear()
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    return logger, log_path
-
-logger, LOG_FILE_PATH = _init_logging()
-
-def ensure_can_interface_up(ifname: str, bitrate: int) -> bool:
-    """Ensure CAN interface is up with a given bitrate. Returns True if up."""
+def _queue_put_latest(q: Queue, item):
+    """Keep only the newest item in the queue."""
     try:
-        # Check current status
-        res = subprocess.run(
-            ["ip", "link", "show", ifname],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=2,
-        )
-        if res.returncode == 0:
-            out = res.stdout.lower()
-            if " state up " in out or "<up," in out or "up>" in out:
-                logger.info(f"[CAN] Interface {ifname} already UP")
-                return True
-        else:
-            logger.warning(f"[CAN] '{ifname}' not found or not available: {res.stderr.strip()}")
-
-        logger.info(f"[CAN] Bringing up {ifname} @ {bitrate} bps")
-        # Bring down (ignore errors)
-        subprocess.run(["ip", "link", "set", ifname, "down"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Configure type/bitrate
-        cfg = subprocess.run(
-            ["ip", "link", "set", ifname, "type", "can", "bitrate", str(bitrate)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=3,
-        )
-        if cfg.returncode != 0:
-            logger.error(f"[CAN] Failed to configure {ifname}: {cfg.stderr.strip()}")
-            return False
-        # Bring up
-        up = subprocess.run(
-            ["ip", "link", "set", ifname, "up"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=3,
-        )
-        if up.returncode != 0:
-            logger.error(f"[CAN] Failed to bring {ifname} up: {up.stderr.strip()}")
-            return False
-
-        # Verify
-        ver = subprocess.run(
-            ["ip", "link", "show", ifname],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=2,
-        )
-        if ver.returncode == 0 and (" state up " in ver.stdout.lower() or "<up," in ver.stdout.lower() or "up>" in ver.stdout.lower()):
-            logger.info(f"[CAN] {ifname} is UP")
-            return True
-        logger.error(f"[CAN] {ifname} did not come UP; status: {ver.stdout.strip()}")
-        return False
-    except FileNotFoundError:
-        logger.error("[CAN] 'ip' command not found. Install iproute2 or run on a system with 'ip'.")
-        return False
-    except subprocess.TimeoutExpired:
-        logger.error(f"[CAN] Timeout while configuring {ifname}")
-        return False
-    except Exception as e:
-        logger.error(f"[CAN] Unexpected error: {e}")
-        return False
-
-
-class RobotState:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.controller_ip = None
-        # 6-axis targets (turns) and robot state
-        self.axes = [0.0] * 6          # positions in turns
-        self.state = "disable"         # enable|disable|estop
-        # Profile storage and player
-        self.profile = []
-        self.player_thread = None
-        # Feedback storage (pos/vel estimates), to be updated by your drive bridge
-        self._fb_pos = [0.0] * 6
-        self._fb_vel = [0.0] * 6
-
-    def set_controller_ip(self, ip):
-        with self.lock:
-            self.controller_ip = ip
-        logger.info(f"Controller IP set to {ip}")
-
-    def get_controller_ip(self):
-        with self.lock:
-            return self.controller_ip
-
-    def set_axes(self, positions):
-        if not isinstance(positions, (list, tuple)) or len(positions) != 6:
-            raise ValueError("positions must be length-6 list/tuple")
-        with self.lock:
-            self.axes = [float(x) for x in positions]
-        logger.info("Axes target set: " + ", ".join(f"{x:.4f}" for x in self.axes))
-
-    def get_axes(self):
-        with self.lock:
-            return list(self.axes)
-
-    def set_state(self, value: str):
-        value = str(value).lower()
-        if value not in ("enable", "disable", "estop"):
-            raise ValueError("state must be one of: enable, disable, estop")
-        with self.lock:
-            self.state = value
-        logger.info(f"State set to: {value}")
-
-    def get_state(self) -> str:
-        with self.lock:
-            return self.state
-
-    # Feedback setters/getters
-    def update_feedback(self, pos=None, vel=None):
-        """Update measured feedback (pos/vel arrays length 6)."""
-        with self.lock:
-            if pos is not None and len(pos) == 6:
-                self._fb_pos = [float(x) for x in pos]
-            if vel is not None and len(vel) == 6:
-                self._fb_vel = [float(x) for x in vel]
-
-    def get_feedback(self):
-        with self.lock:
-            return (list(self._fb_pos), list(self._fb_vel))
-
-def udp_telemetry_sender(state: RobotState):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    while True:
-        time.sleep(0.1)
-        ctrl_ip = state.get_controller_ip()
-        if not ctrl_ip:
-            continue
-        # Prefer real feedback if available; otherwise fall back to targets + zeros
-        fb_pos, fb_vel = state.get_feedback()
-        if not any(fb_pos):  # simple heuristic; customize as needed
-            fb_pos = state.get_axes()
-        msg = {"t": time.time(), "pos": [float(x) for x in fb_pos], "vel": [float(x) for x in fb_vel]}
-        try:
-            sock.sendto(json.dumps(msg).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
-        except Exception as e:
-            logger.error(f"[UDP] Telemetry send error: {e}")
-
-
-def axes_state_logger(state: RobotState):
-    while True:
-        try:
-            axes = state.get_axes()
-            st = state.get_state()
-            logger.info(f"[LOG] State={st} Axes(turns)=[" +
-                        ", ".join(f"{x:.3f}" for x in axes) + "]")
-        except Exception as e:
-            logger.error(f"[LOG] Error reading state/axes: {e}")
-        time.sleep(1.0)
-
-
-# Fallback: define a no-op ODriveCANBridge if the real one isn't present
-try:
-    ODriveCANBridge  # type: ignore[name-defined]
-except NameError:
-    class ODriveCANBridge(threading.Thread):
-        """No-op ODrive bridge so the server can run without drive I/O."""
-        def __init__(self, state):
-            super().__init__(daemon=True)
-            self._stop = threading.Event()
-        def stop(self):
-            self._stop.set()
-        def run(self):
-            try:
-                logger.info("ODriveCANBridge stub active (no CAN I/O)")
-            except Exception:
-                print("ODriveCANBridge stub active (no CAN I/O)")
-            while not self._stop.is_set():
-                time.sleep(0.5)
-
-# Fallback: define tcp_command_server if missing
-try:
-    tcp_command_server  # type: ignore[name-defined]
-except NameError:
-    def tcp_command_server(state):
-        """Minimal TCP command server accepting axes/state/profile messages."""
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            srv.bind(("0.0.0.0", TCP_CMD_PORT))
-        except OSError as e:
-            try:
-                logger.error(f"[TCP] Bind failed on :{TCP_CMD_PORT} ({e}). Exiting tcp thread.")
-            except Exception:
-                print(f"[TCP] Bind failed on :{TCP_CMD_PORT} ({e}). Exiting tcp thread.")
-            return
-        srv.listen(1)
-        try:
-            logger.info(f"[TCP] Listening on :{TCP_CMD_PORT}")
-        except Exception:
-            print(f"[TCP] Listening on :{TCP_CMD_PORT}")
         while True:
-            conn, addr = srv.accept()
-            try:
-                logger.info(f"[TCP] Controller connected from {addr}")
-            except Exception:
-                print(f"[TCP] Controller connected from {addr}")
-            state.set_controller_ip(addr[0])
-            try:
-                with conn, conn.makefile("r") as f:
-                    for line in f:
-                        try:
-                            msg = json.loads(line.strip())
-                            mtype = msg.get("type")
-                            if mtype == "axes":
-                                state.set_axes(msg.get("positions", []))
-                            elif mtype == "state":
-                                state.set_state(msg.get("value", "disable"))
-                            elif mtype == "profile_upload":
-                                state.set_profile(msg.get("profile", []))
-                            elif mtype == "profile_start":
-                                rate_hz = float(msg.get("rate_hz", 100.0))
-                                state.start_profile(rate_hz)
-                            elif mtype == "profile_stop":
-                                state.stop_profile()
-                            else:
-                                try:
-                                    logger.warning(f"[TCP] Unknown command type: {mtype}")
-                                except Exception:
-                                    print(f"[TCP] Unknown command type: {mtype}")
-                        except Exception as e:
-                            try:
-                                logger.error(f"[TCP] Bad command: {e}")
-                            except Exception:
-                                print(f"[TCP] Bad command: {e}")
-            except Exception as e:
-                try:
-                    logger.error(f"[TCP] Connection error: {e}")
-                except Exception:
-                    print(f"[TCP] Connection error: {e}")
-            finally:
-                state.stop_profile()
-                try:
-                    logger.info("[TCP] Controller disconnected")
-                except Exception:
-                    print("[TCP] Controller disconnected")
-
-# Fallback: define udp_telemetry_sender if missing
-try:
-    udp_telemetry_sender  # type: ignore[name-defined]
-except NameError:
-    def udp_telemetry_sender(state):
-        """Sends pos/vel arrays (or fallbacks) over UDP at ~10 Hz."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        while True:
-            time.sleep(0.1)
-            ctrl_ip = state.get_controller_ip()
-            if not ctrl_ip:
-                continue
-            # Try to use feedback if available; fall back to targets & zeros
-            try:
-                fb_pos, fb_vel = state.get_feedback()
-            except Exception:
-                fb_pos, fb_vel = ([], [])
-            if not fb_pos or len(fb_pos) != 6:
-                fb_pos = state.get_axes()
-            if not fb_vel or len(fb_vel) != 6:
-                fb_vel = [0.0] * 6
-            msg = {
-                "t": time.time(),
-                "pos": [float(x) for x in fb_pos],
-                "vel": [float(x) for x in fb_vel],
-            }
-            try:
-                sock.sendto(json.dumps(msg).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
-            except Exception as e:
-                try:
-                    logger.error(f"[UDP] Telemetry send error: {e}")
-                except Exception:
-                    print(f"[UDP] Telemetry send error: {e}")
-
-# Fallback: define axes_state_logger if missing
-try:
-    axes_state_logger  # type: ignore[name-defined]
-except NameError:
-    def axes_state_logger(state):
-        """Logs current state and targets at 1 Hz."""
-        while True:
-            try:
-                axes = state.get_axes()
-                st = state.get_state()
-                logger.info(f"[LOG] State={st} Axes(turns)=[" +
-                            ", ".join(f"{x:.3f}" for x in axes) + "]")
-            except Exception as e:
-                try:
-                    logger.error(f"[LOG] Error reading state/axes: {e}")
-                except Exception:
-                    print(f"[LOG] Error reading state/axes: {e}")
-            time.sleep(1.0)
-
-# --- main ---
-if __name__ == "__main__":
-    state = RobotState()
-
-    # Start ODrive CAN bridge (real or stub)
-    odrv_bridge = ODriveCANBridge(state)
-    odrv_bridge.start()
-
-    threading.Thread(target=tcp_command_server, args=(state,), daemon=True).start()
-    threading.Thread(target=udp_telemetry_sender, args=(state,), daemon=True).start()
-    threading.Thread(target=axes_state_logger, args=(state,), daemon=True).start()
-    try:
-        logger.info("Robot server running. Press Ctrl+C to exit.")
+            q.get_nowait()
     except Exception:
-        print("Robot server running. Press Ctrl+C to exit.")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
+        pass
+    q.put(item)
+
+
+class CommandClient(threading.Thread):
+    """TCP client that reliably sends commands to the robot with auto-reconnect."""
+    def __init__(self, host, port, cmd_queue: Queue, status_cb=None):
+        super().__init__(daemon=True)
+        self.host = host
+        self.port = port
+        self.cmd_queue = cmd_queue
+        self.status_cb = status_cb
+        self._stop = threading.Event()
+        self._sock = None
+
+    def run(self):
+        last_cmd = None
+        while not self._stop.is_set():
+            try:
+                # Connect (block/retry)
+                if self.status_cb:
+                    self.status_cb("Connecting to robot (TCP)...")
+                self._sock = socket.create_connection((self.host, self.port), timeout=5)
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if self.status_cb:
+                    self.status_cb("Connected (TCP)")
+                # If we already have a last command, send it after reconnect
+                if last_cmd is not None:
+                    self._send_cmd(last_cmd)
+
+                # Main send loop
+                while not self._stop.is_set():
+                    cmd = self.cmd_queue.get()  # blocks until new command
+                    last_cmd = cmd
+                    self._send_cmd(cmd)
+            except Exception as e:
+                if self.status_cb:
+                    self.status_cb(f"TCP disconnected: {e}. Reconnecting in 1s...")
+                self._close()
+                time.sleep(1)
+
+        self._close()
+
+    def _send_cmd(self, cmd_value):
+        if not self._sock:
+            return
+        # Only accept dict commands (axes/state). Ignore non-dicts.
+        if not isinstance(cmd_value, dict):
+            return
+        msg = json.dumps(cmd_value) + "\n"
+        self._sock.sendall(msg.encode("utf-8"))
+
+    def stop(self):
+        self._stop.set()
+        self._close()
+
+    def _close(self):
         try:
-            logger.info("Shutting down...")
+            if self._sock:
+                self._sock.close()
         except Exception:
-            print("Shutting down...")
-        odrv_bridge.stop()
+            pass
+        self._sock = None
+
+
+def telemetry_listener(udp_port: int, telem_queue: Queue, status_cb=None):
+    """Listen for UDP telemetry and push (t, val) into telem_queue."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Reuse addr for quick restarts
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", udp_port))
+    if status_cb:
+        status_cb(f"Telemetry: listening UDP :{udp_port}")
+    while True:
+        try:
+            data, _ = sock.recvfrom(4096)
+            # Expect JSON: {"t": <unix_time>, "val": <float>}
+            telem = json.loads(data.decode("utf-8"))
+            t = float(telem.get("t", time.time()))
+            val = float(telem["val"])
+            telem_queue.put((t, val))
+        except Exception as e:
+            if status_cb:
+                status_cb(f"Telemetry error: {e}")
+            # brief pause to avoid tight loop on persistent error
+            time.sleep(0.05)
+
+
+class RobotGUI(QWidget):
+    def __init__(self, cmd_queue, telem_queue):
+        super().__init__()
+        self.setWindowTitle("Robot Controller + Telemetry")
+        self.resize(800, 600)
+
+        self.cmd_queue = cmd_queue
+        self.telem_queue = telem_queue
+
+        # --- Layout ---
+        layout = QVBoxLayout()
+
+        # Status label
+        self.status_label = QLabel("Telemetry: waiting...")
+        layout.addWidget(self.status_label)
+
+        # Axis controls (1-6) in turns
+        axes_layout = QVBoxLayout()
+        self.axis_spins = []
+        for i in range(6):
+            row = QHBoxLayout()
+            lbl = QLabel(f"Axis {i+1} (turns)")
+            spin = QDoubleSpinBox()
+            spin.setDecimals(3)
+            spin.setRange(-10.0, 10.0)
+            spin.setSingleStep(0.01)
+            spin.setValue(0.0)
+            # Send an axes command on any change
+            spin.valueChanged.connect(self.send_axes)
+            row.addWidget(lbl)
+            row.addWidget(spin)
+            axes_layout.addLayout(row)
+            self.axis_spins.append(spin)
+        layout.addLayout(axes_layout)
+
+        # State controls
+        state_layout = QHBoxLayout()
+        self.btn_enable = QPushButton("Enable")
+        self.btn_disable = QPushButton("Disable")
+        self.btn_estop = QPushButton("ESTOP")
+        self.btn_enable.clicked.connect(lambda: self.send_state("enable"))
+        self.btn_disable.clicked.connect(lambda: self.send_state("disable"))
+        self.btn_estop.clicked.connect(lambda: self.send_state("estop"))
+        state_layout.addWidget(self.btn_enable)
+        state_layout.addWidget(self.btn_disable)
+        state_layout.addWidget(self.btn_estop)
+        layout.addLayout(state_layout)
+
+        # Profile controls: dropdown + send + start + rate
+        prof_layout = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        self.profile_refresh_btn = QPushButton("Refresh")
+        self.profile_send_btn = QPushButton("Send Profile")
+        self.profile_rate = QDoubleSpinBox()
+        self.profile_rate.setDecimals(1)
+        self.profile_rate.setRange(1.0, 1000.0)
+        self.profile_rate.setSingleStep(10.0)
+        self.profile_rate.setValue(100.0)
+        self.profile_start_btn = QPushButton("Start Profile")
+        self.profile_refresh_btn.clicked.connect(self.populate_profile_dropdown)
+        self.profile_send_btn.clicked.connect(self.on_send_profile)
+        self.profile_start_btn.clicked.connect(self.on_start_profile)
+        prof_layout.addWidget(QLabel("Profile CSV:"))
+        prof_layout.addWidget(self.profile_combo, 1)
+        prof_layout.addWidget(self.profile_refresh_btn)
+        prof_layout.addWidget(self.profile_send_btn)
+        prof_layout.addWidget(QLabel("Rate (Hz):"))
+        prof_layout.addWidget(self.profile_rate)
+        prof_layout.addWidget(self.profile_start_btn)
+        layout.addLayout(prof_layout)
+
+        # --- Telemetry plot ---
+        self.plot = pg.PlotWidget(title="Telemetry Data (Sensor Value)")
+        self.plot.setLabel('bottom', 'Time', 's')
+        self.plot.setLabel('left', 'Value')
+        self.plot.showGrid(x=True, y=True)
+
+        self.curve = self.plot.plot(pen='y')
+        layout.addWidget(self.plot)
+
+        self.setLayout(layout)
+
+        # Data buffer
+        self.xdata = []
+        self.ydata = []
+        self.start_time = time.time()
+
+        # Initialize profile dropdown (Profiles subfolder)
+        self.populate_profile_dropdown()
+
+        # Timer to refresh GUI
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_gui)
+        self.timer.start(100)  # update every 100 ms
+
+    def _profiles_dir(self) -> str:
+        """Return absolute path to the Profiles subfolder, creating it if missing."""
+        base = os.getcwd()
+        pdir = os.path.join(base, "Profiles")
+        os.makedirs(pdir, exist_ok=True)
+        return pdir
+
+    def send_axes(self, *_):
+        """Send 6-axis position command in turns."""
+        positions = [float(sp.value()) for sp in self.axis_spins]
+        cmd = {"type": "axes", "positions": positions, "units": "turns"}
+        _queue_put_latest(self.cmd_queue, cmd)
+
+    def send_state(self, state_value: str):
+        """Send robot state command."""
+        cmd = {"type": "state", "value": state_value}
+        _queue_put_latest(self.cmd_queue, cmd)
+
+    def _load_csv_as_profile(self, path: str):
+        """Load CSV profile with rows: time, axis1..axis6."""
+        rows = []
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            rows = [r for r in reader if any(cell.strip() for cell in r)]
+        if not rows:
+            raise ValueError("empty CSV")
+        # Skip header if first cell not numeric
+        start_idx = 0
+        try:
+            float(rows[0][0])
+        except Exception:
+            start_idx = 1
+        profile_rows = []
+        for r in rows[start_idx:]:
+            if len(r) < 7:
+                raise ValueError("each row must have at least 7 columns: time + 6 axes")
+            t = float(r[0])
+            axes = [float(x) for x in r[1:7]]
+            profile_rows.append([t] + axes)
+        # Ensure monotonic non-decreasing time
+        times = [row[0] for row in profile_rows]
+        if any(t2 < t1 for t1, t2 in zip(times, times[1:])):
+            raise ValueError("time column must be non-decreasing")
+        return profile_rows
+
+    def populate_profile_dropdown(self):
+        """Scan Profiles subdirectory for CSV files and populate the dropdown."""
+        pdir = self._profiles_dir()
+        csvs = sorted([f for f in os.listdir(pdir) if f.lower().endswith(".csv")])
+        self.profile_combo.clear()
+        if not csvs:
+            self.profile_combo.addItem("(no .csv files in Profiles/)")
+            self.profile_combo.setEnabled(False)
+        else:
+            self.profile_combo.setEnabled(True)
+            for f in csvs:
+                self.profile_combo.addItem(f)
+
+    def on_send_profile(self):
+        """Parse selected CSV from Profiles and send it to the robot server."""
+        if not self.profile_combo.isEnabled():
+            self.status_label.setText("No CSV profile to send (Profiles/ empty)")
+            return
+        fname = self.profile_combo.currentText()
+        if not fname or fname.startswith("("):
+            self.status_label.setText("Select a valid CSV profile")
+            return
+        path = os.path.join(self._profiles_dir(), fname)
+        try:
+            profile_rows = self._load_csv_as_profile(path)
+            cmd = {"type": "profile_upload", "profile": profile_rows}
+            _queue_put_latest(self.cmd_queue, cmd)
+            self.status_label.setText(f"Sent profile: {fname} ({len(profile_rows)} pts)")
+        except Exception as e:
+            self.status_label.setText(f"Profile send failed: {e}")
+
+    def on_start_profile(self):
+        """Send a profile_start with selected rate."""
+        rate = float(self.profile_rate.value())
+        cmd = {"type": "profile_start", "rate_hz": rate}
+        _queue_put_latest(self.cmd_queue, cmd)
+        self.status_label.setText(f"Profile start requested at {rate:.1f} Hz")
+
+    def update_gui(self):
+        """Check telemetry and update GUI."""
+        while not self.telem_queue.empty():
+            t, val = self.telem_queue.get()
+            self.xdata.append(t - self.start_time)
+            self.ydata.append(val)
+
+            # Limit buffer size
+            if len(self.xdata) > 200:
+                self.xdata = self.xdata[-200:]
+                self.ydata = self.ydata[-200:]
+
+            self.status_label.setText(f"Telemetry: value={val:.2f}")
+
+        # Update plot
+        self.curve.setData(self.xdata, self.ydata)
+
+
+# --- Simulated Robot ---  # (not used when connected to real robot)
+# def robot_sim(cmd_queue, telem_queue):
+#     ...
+
+if __name__ == "__main__":
+    cmd_queue = Queue(maxsize=1)   # keep only the latest command
+    telem_queue = Queue()
+
+    # Start telemetry listener thread (UDP)
+    telem_thread = threading.Thread(
+        target=telemetry_listener,
+        args=(UDP_TELEM_PORT, telem_queue, lambda s: print(s)),
+        daemon=True,
+    )
+    telem_thread.start()
+
+    # Start TCP command client
+    cmd_client = CommandClient(
+        ROBOT_HOST, TCP_CMD_PORT, cmd_queue, status_cb=lambda s: print(s)
+    )
+    cmd_client.start()
+
+    # Start GUI
+    app = QApplication(sys.argv)
+    gui = RobotGUI(cmd_queue, telem_queue)
+    gui.show()
+    sys.exit(app.exec())
