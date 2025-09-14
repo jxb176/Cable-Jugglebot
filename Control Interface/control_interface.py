@@ -316,18 +316,57 @@ class RobotGUI(QWidget):
     def update_gui(self):
         """Check telemetry and update GUI."""
         while not self.telem_queue.empty():
-            t, val = self.telem_queue.get()
-            self.xdata.append(t - self.start_time)
-            self.ydata.append(val)
+            telem = self.telem_queue.get()
 
-            # Limit buffer size
-            if len(self.xdata) > 200:
-                self.xdata = self.xdata[-200:]
-                self.ydata = self.ydata[-200:]
-                self.status_label.setText("Telemetry: arrays (pos/vel) received")
-            # Legacy single value
-            elif "val" in telem:
-                val = float(telem["val"])
+            # New formats: dicts
+            if isinstance(telem, dict):
+                t = float(telem.get("t", time.time()))
+                # Array format: {"pos":[...], "vel":[...]}
+                if "pos" in telem or "vel" in telem:
+                    pos = telem.get("pos", self.last_pos)
+                    vel = telem.get("vel", self.last_vel)
+                    # Update labels safely
+                    for i in range(6):
+                        try:
+                            p = float(pos[i]) if i < len(pos) else float("nan")
+                        except Exception:
+                            p = float("nan")
+                        try:
+                            v = float(vel[i]) if i < len(vel) else float("nan")
+                        except Exception:
+                            v = float("nan")
+                        self.fb_labels[i][0].setText(f"{p:.4f}")
+                        self.fb_labels[i][1].setText(f"{v:.4f}")
+                    # Cache last arrays
+                    if isinstance(pos, list) and len(pos) >= 6:
+                        self.last_pos = [float(x) for x in pos[:6]]
+                    if isinstance(vel, list) and len(vel) >= 6:
+                        self.last_vel = [float(x) for x in vel[:6]]
+                    # Plot axis 1 position (if available)
+                    self.xdata.append(t - self.start_time)
+                    self.ydata.append(self.last_pos[0] if self.last_pos else 0.0)
+                    if len(self.xdata) > 200:
+                        self.xdata = self.xdata[-200:]
+                        self.ydata = self.ydata[-200:]
+                    self.status_label.setText("Telemetry: arrays (pos/vel) received")
+                # Legacy dict with single value: {"val": <float>}
+                elif "val" in telem:
+                    val = float(telem["val"])
+                    self.xdata.append(t - self.start_time)
+                    self.ydata.append(val)
+                    if len(self.xdata) > 200:
+                        self.xdata = self.xdata[-200:]
+                        self.ydata = self.ydata[-200:]
+                    self.status_label.setText(f"Telemetry: value={val:.2f}")
+
+            # Legacy tuple format: (t, val)
+            elif isinstance(telem, (tuple, list)) and len(telem) >= 2:
+                try:
+                    t = float(telem[0])
+                    val = float(telem[1])
+                except Exception:
+                    # Skip malformed tuple
+                    continue
                 self.xdata.append(t - self.start_time)
                 self.ydata.append(val)
                 if len(self.xdata) > 200:

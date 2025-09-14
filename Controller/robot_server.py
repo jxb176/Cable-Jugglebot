@@ -130,6 +130,9 @@ class RobotState:
         self.state = "disable"         # enable|disable|estop
         self.profile = []
         self.player_thread = None
+        # Add feedback storage (populated by your drive/telemetry bridge)
+        self._fb_pos = None  # type: list[float] | None
+        self._fb_vel = None  # type: list[float] | None
 
     def set_controller_ip(self, ip):
         with self.lock:
@@ -162,6 +165,22 @@ class RobotState:
     def get_state(self) -> str:
         with self.lock:
             return self.state
+
+    # Add feedback helpers (no fallback to commands)
+    def update_feedback(self, pos=None, vel=None):
+        """Update measured feedback (arrays length 6)."""
+        with self.lock:
+            if pos is not None and isinstance(pos, (list, tuple)) and len(pos) == 6:
+                self._fb_pos = [float(x) for x in pos]
+            if vel is not None and isinstance(vel, (list, tuple)) and len(vel) == 6:
+                self._fb_vel = [float(x) for x in vel]
+
+    def get_feedback(self):
+        with self.lock:
+            return (
+                list(self._fb_pos) if isinstance(self._fb_pos, list) else None,
+                list(self._fb_vel) if isinstance(self._fb_vel, list) else None,
+            )
 
     def set_profile(self, profile_points):
         if not isinstance(profile_points, (list, tuple)) or len(profile_points) == 0:
@@ -435,10 +454,17 @@ def udp_telemetry_sender(state: RobotState):
         ctrl_ip = state.get_controller_ip()
         if not ctrl_ip:
             continue
-        axes = state.get_axes()
-        a1 = axes[0] if axes else 0.0
-        val = a1 + random.uniform(-0.05, 0.05)
-        msg = {"t": time.time(), "val": float(val)}
+        # Only send when we have real feedback available (no fallback to commands)
+        fb_pos, fb_vel = state.get_feedback()
+        if not (isinstance(fb_pos, list) and len(fb_pos) == 6 and
+                isinstance(fb_vel, list) and len(fb_vel) == 6):
+            # Skip sending until first valid feedback arrives
+            continue
+        msg = {
+            "t": time.time(),
+            "pos": [float(x) for x in fb_pos],
+            "vel": [float(x) for x in fb_vel],
+        }
         try:
             sock.sendto(json.dumps(msg).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
         except Exception as e:
