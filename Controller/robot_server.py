@@ -8,6 +8,7 @@ import os
 import logging
 from datetime import datetime
 import subprocess
+import asyncio  # <-- make asyncio available at module scope
 
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
@@ -20,7 +21,7 @@ ODRIVE_COMMAND_RATE_HZ = 200.0
 ODRIVE_LOG_RATE_HZ = 2.0
 
 try:
-    import odrive_can as odc  # Assumes a module providing ODrive CAN helpers
+    import odrive_can as odc
 except Exception:
     odc = None
 
@@ -248,9 +249,7 @@ class ODriveCANBridge(threading.Thread):
 
     def _feedback_cb(self, axis_id: int):
         def _cb(msg, caller):
-            # Print the raw feedback message as in the example
             print(f"[ODRV] axis={axis_id} feedback: {msg}")
-            # Track we received feedback for this axis
             self._feedback_seen[axis_id] = self._feedback_seen.get(axis_id, 0) + 1
         return _cb
 
@@ -260,41 +259,52 @@ class ODriveCANBridge(threading.Thread):
             logger.warning("odrive_can not available; running in simulation mode (no CAN I/O)")
             return
 
+        # Try to create a python-can Bus to pass into ODriveCAN
+        can_bus = None
+        try:
+            import can  # python-can
+            can_bus = can.interface.Bus(channel=ODRIVE_INTERFACE, bustype="socketcan")
+            logger.info(f"[CAN] python-can bus created for {ODRIVE_INTERFACE}")
+        except Exception as e:
+            logger.warning(f"[CAN] Could not create python-can bus for {ODRIVE_INTERFACE}: {e}")
+
         for aid in AXIS_NODE_IDS:
             try:
                 drv = None
                 last_err = None
 
-                # Try several likely constructor signatures in order
-                ctor_attempts = [
-                    ("kw axis_id+interface",      lambda: odc.ODriveCAN(axis_id=aid, interface=ODRIVE_INTERFACE)),
+                ctor_attempts = []
+                if can_bus is not None:
+                    # Prefer passing an actual bus object
+                    ctor_attempts.append(("kw axis_id+busObj", lambda: odc.ODriveCAN(axis_id=aid, bus=can_bus)))
+                # Fallbacks (may work on other versions)
+                ctor_attempts.extend([
                     ("kw axis_id+channel",        lambda: odc.ODriveCAN(axis_id=aid, channel=ODRIVE_INTERFACE)),
-                    ("kw axis_id+bus",            lambda: odc.ODriveCAN(axis_id=aid, bus=ODRIVE_INTERFACE)),
-                    ("pos (axis_id, interface)",  lambda: odc.ODriveCAN(aid, ODRIVE_INTERFACE)),
+                    ("pos (axis_id, interface)",  lambda: odc.ODriveCAN(aid, ODRIVE_INTERFACE)),  # may pass str (not ideal)
                     ("pos (axis_id,)",            lambda: odc.ODriveCAN(aid)),
                     ("kw axis_id only",           lambda: odc.ODriveCAN(axis_id=aid)),
-                ]
+                ])
 
                 for label, factory in ctor_attempts:
                     try:
                         drv = factory()
                         logger.info(f"ODrive axis {aid}: constructed with '{label}'")
+                        # sanity check: avoid keeping a driver if its internal bus is a str
+                        if hasattr(drv, "_bus") and isinstance(getattr(drv, "_bus"), str):
+                            raise TypeError("Driver _bus is str; expected bus object")
                         break
-                    except TypeError as e:
-                        last_err = e
-                        continue
                     except Exception as e:
                         last_err = e
+                        drv = None
                         continue
 
                 if drv is None:
                     raise RuntimeError(f"ODriveCAN constructor not compatible for axis {aid}: {last_err}")
 
-                # Attach feedback callback and start
                 drv.feedback_callback = self._feedback_cb(aid)
                 await drv.start()
 
-                # Optional: configure controller mode for position control (per your example)
+                # Optional: configure controller mode for position control (per example)
                 drv.check_errors()
                 drv.set_controller_mode("POSITION_CONTROL", "POS_FILTER")
                 drv.set_linear_count(0)
@@ -305,20 +315,17 @@ class ODriveCANBridge(threading.Thread):
                 logger.error(f"Failed to init ODrive axis {aid}: {e}")
 
     async def _apply_state(self, st: str):
-        """Apply state across all axes."""
         if not self._drivers:
             return
         try:
             if st == "enable":
-                # Enter closed loop control on all axes
-                for aid, drv in self._drivers:
+                for _, drv in self._drivers:
                     await drv.set_axis_state("CLOSED_LOOP_CONTROL")
             elif st == "disable":
-                for aid, drv in self._drivers:
+                for _, drv in self._drivers:
                     await drv.set_axis_state("IDLE")
             elif st == "estop":
-                # If your API supports a hard stop/estop, call it; otherwise go to IDLE
-                for aid, drv in self._drivers:
+                for _, drv in self._drivers:
                     try:
                         await drv.set_axis_state("IDLE")
                     except Exception:
@@ -327,7 +334,6 @@ class ODriveCANBridge(threading.Thread):
             logger.error(f"Failed applying state '{st}' to ODrive: {e}")
 
     async def _stream_positions(self):
-        """Main async loop: stream setpoints and periodically log feedback counts."""
         dt_cmd = 1.0 / max(1e-3, ODRIVE_COMMAND_RATE_HZ)
         dt_log = 1.0 / max(1e-3, ODRIVE_LOG_RATE_HZ)
         t0 = time.perf_counter()
@@ -338,12 +344,10 @@ class ODriveCANBridge(threading.Thread):
             now = time.perf_counter()
             st = self.state.get_state()
 
-            # Apply state transition if changed
             if st != self._last_state:
                 await self._apply_state(st)
                 self._last_state = st
 
-            # Send positions when enabled
             if self._drivers and st == "enable" and (now - last_cmd) >= dt_cmd:
                 positions = self.state.get_axes()
                 for i, (aid, drv) in enumerate(self._drivers):
@@ -353,14 +357,12 @@ class ODriveCANBridge(threading.Thread):
                         logger.error(f"Axis {aid} set_input_pos failed: {e}")
                 last_cmd = now
 
-            # Periodic summary of feedback received
             if (now - last_log) >= dt_log:
                 summary = ", ".join(f"{aid}:{self._feedback_seen.get(aid,0)}"
                                     for aid, _ in self._drivers)
                 logger.info(f"[ODRV] feedback counts: {summary if summary else 'no drivers'}")
                 last_log = now
 
-            # Sleep a small slice to keep loop responsive
             await asyncio.sleep(0.002)
 
     async def _run_async(self):
@@ -370,14 +372,11 @@ class ODriveCANBridge(threading.Thread):
 
     def run(self):
         if odc is None:
-            # Simulation mode: just idle loop with logs
             logger.warning("ODrive bridge running in simulation mode (odrive_can missing)")
             while not self._stop.is_set():
                 time.sleep(0.5)
             return
-
         try:
-            import asyncio
             asyncio.run(self._run_async())
         except Exception as e:
             logger.error(f"ODrive asyncio loop error: {e}")
