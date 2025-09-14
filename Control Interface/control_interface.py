@@ -1,3 +1,13 @@
+import sys
+import threading
+import time
+import random
+from queue import Queue
+import socket
+import json
+import os
+import csv
+import base64
 # robot_server.py
 import socket
 import json
@@ -275,7 +285,7 @@ if __name__ == "__main__":
     logger.info("Robot server running. Press Ctrl+C to exit.")
     while True:
         time.sleep(1)
-
+# GUI client below here
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
     QLabel, QSlider, QHBoxLayout, QDoubleSpinBox, QComboBox
@@ -285,12 +295,10 @@ from PyQt6.QtGui import QGuiApplication
 
 import pyqtgraph as pg
 
-
 # Networking configuration
 ROBOT_HOST = "jugglepi.local"  # <-- set to your Raspberry Pi IP or hostname
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
-
 
 def _queue_put_latest(q: Queue, item):
     """Keep only the newest item in the queue."""
@@ -300,7 +308,6 @@ def _queue_put_latest(q: Queue, item):
     except Exception:
         pass
     q.put(item)
-
 
 class CommandClient(threading.Thread):
     """TCP client that reliably sends commands to the robot with auto-reconnect."""
@@ -325,7 +332,7 @@ class CommandClient(threading.Thread):
                 if self.status_cb:
                     self.status_cb("Connected (TCP)")
 
-                # Start receiver thread
+                # Start receiver thread for server-originated messages (e.g., log_file)
                 self._rx_thread = threading.Thread(target=self._recv_loop, daemon=True)
                 self._rx_thread.start()
 
@@ -352,9 +359,6 @@ class CommandClient(threading.Thread):
                     mtype = msg.get("type")
                     if mtype == "log_file":
                         self._handle_log_file(msg)
-                    else:
-                        # Other server-originated messages could be handled here
-                        pass
                 except Exception as e:
                     if self.status_cb:
                         self.status_cb(f"RX parse error: {e}")
@@ -381,6 +385,7 @@ class CommandClient(threading.Thread):
     def _send_cmd(self, cmd_value):
         if not self._sock:
             return
+        # Only dict messages are valid (axes/state/profile/log requests)
         if not isinstance(cmd_value, dict):
             return
         msg = json.dumps(cmd_value) + "\n"
@@ -398,11 +403,9 @@ class CommandClient(threading.Thread):
             pass
         self._sock = None
 
-
 def telemetry_listener(udp_port: int, telem_queue: Queue, status_cb=None):
     """Listen for UDP telemetry and push (t, val) into telem_queue."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Reuse addr for quick restarts
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", udp_port))
     if status_cb:
@@ -418,9 +421,7 @@ def telemetry_listener(udp_port: int, telem_queue: Queue, status_cb=None):
         except Exception as e:
             if status_cb:
                 status_cb(f"Telemetry error: {e}")
-            # brief pause to avoid tight loop on persistent error
             time.sleep(0.05)
-
 
 class RobotGUI(QWidget):
     def __init__(self, cmd_queue, telem_queue):
@@ -633,13 +634,9 @@ class RobotGUI(QWidget):
             self.status_label.setText(f"Telemetry: value={val:.2f}")
         self.curve.setData(self.xdata, self.ydata)
 
-
-# --- Simulated Robot ---  # (not used when connected to real robot)
-# def robot_sim(cmd_queue, telem_queue):
-#     ...
-
+# --- Entry point: make sure the GUI launches this app, not server code ---
 if __name__ == "__main__":
-    # Print any uncaught exceptions to terminal
+    # Surface any uncaught exceptions
     def _excepthook(exc_type, exc, tb):
         import traceback
         traceback.print_exception(exc_type, exc, tb)
