@@ -627,30 +627,51 @@ class RobotGUI(QWidget):
 #     ...
 
 if __name__ == "__main__":
-    # Start GUI first to ensure the window appears immediately
-    app = QApplication(sys.argv)
+    # Helpful: print unhandled exceptions instead of silently dying
+    def _excepthook(exc_type, exc, tb):
+        import traceback
+        traceback.print_exception(exc_type, exc, tb)
+    sys.excepthook = _excepthook
 
-    cmd_queue = Queue(maxsize=1)   # keep only the latest command
+    # Create the Qt app first
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+
+    cmd_queue = Queue(maxsize=1)
     telem_queue = Queue()
 
+    # Build and show GUI immediately
     gui = RobotGUI(cmd_queue, telem_queue)
     gui.status_label.setText("Starting...")
     gui.show()
+    gui.raise_()
+    gui.activateWindow()
+    print("[GUI] Shown")
 
-    # Now start background threads (non-blocking)
-    # Telemetry listener (UDP)
-    telem_thread = threading.Thread(
-        target=telemetry_listener,
-        args=(UDP_TELEM_PORT, telem_queue, lambda s: print(s)),
-        daemon=True,
-    )
-    telem_thread.start()
+    # Defer starting background threads until the event loop starts
+    def _start_background():
+        print("[BG] Starting threads")
 
-    # TCP command client
-    cmd_client = CommandClient(
-        ROBOT_HOST, TCP_CMD_PORT, cmd_queue, status_cb=lambda s: print(s)
-    )
-    cmd_client.start()
+        # Telemetry listener (UDP)
+        telem_thread = threading.Thread(
+            target=telemetry_listener,
+            args=(UDP_TELEM_PORT, telem_queue, lambda s: print("[TELEM]", s)),
+            daemon=True,
+        )
+        telem_thread.start()
+
+        # TCP command client
+        cmd_client = CommandClient(
+            ROBOT_HOST, TCP_CMD_PORT, cmd_queue, status_cb=lambda s: print("[TCP]", s)
+        )
+        cmd_client.daemon = True
+        cmd_client.start()
+
+        gui.status_label.setText("Ready")
+
+    from PyQt6.QtCore import QTimer
+    QTimer.singleShot(0, _start_background)
 
     # Enter Qt event loop
+    print("[GUI] Entering event loop")
     sys.exit(app.exec())
