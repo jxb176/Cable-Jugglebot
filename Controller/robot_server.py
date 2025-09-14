@@ -266,14 +266,58 @@ class ODriveCANBridge(threading.Thread):
         self._last_state = None
         self._last_log = 0.0
         self._feedback_seen = {aid: 0 for aid in AXIS_NODE_IDS}
+        # Cache last feedback per axis (store None until we get data)
+        self._pos_cache = {aid: None for aid in range(6)}
+        self._vel_cache = {aid: None for aid in range(6)}
 
     def stop(self):
         self._stop.set()
 
+    def _publish_feedback_if_any(self):
+        """Assemble arrays (len 6) from caches; publish whatever is available."""
+        pos_arr = [self._pos_cache[i] if self._pos_cache[i] is not None else None for i in range(6)]
+        vel_arr = [self._vel_cache[i] if self._vel_cache[i] is not None else None for i in range(6)]
+        # Update RobotState with whatever we have; the UDP sender will include available fields
+        self.state.update_feedback(pos=pos_arr, vel=vel_arr)
+
     def _feedback_cb(self, axis_id: int):
         def _cb(msg, caller):
-            print(f"[ODRV] axis={axis_id} feedback: {msg}")
+            # Try to extract pos_estimate, vel_estimate robustly from the message
+            pos_val = None
+            vel_val = None
+            try:
+                # Pattern A: attributes (e.g., msg.pos_estimate, msg.vel_estimate)
+                if hasattr(msg, "pos_estimate"):
+                    pos_val = float(getattr(msg, "pos_estimate"))
+                if hasattr(msg, "vel_estimate"):
+                    vel_val = float(getattr(msg, "vel_estimate"))
+                # Pattern B: dict-like payload
+                data = getattr(msg, "data", None)
+                if isinstance(data, dict):
+                    if pos_val is None and "pos_estimate" in data:
+                        pos_val = float(data["pos_estimate"])
+                    if vel_val is None and "vel_estimate" in data:
+                        vel_val = float(data["vel_estimate"])
+                # Pattern C: 2-tuple/list [pos, vel]
+                if pos_val is None or vel_val is None:
+                    if isinstance(data, (list, tuple)) and len(data) >= 2:
+                        if pos_val is None:
+                            pos_val = float(data[0])
+                        if vel_val is None:
+                            vel_val = float(data[1])
+            except Exception:
+                # ignore parse errors; leave values as None
+                pass
+
+            # Update caches and mark seen
+            if pos_val is not None:
+                self._pos_cache[axis_id] = pos_val
+            if vel_val is not None:
+                self._vel_cache[axis_id] = vel_val
             self._feedback_seen[axis_id] = self._feedback_seen.get(axis_id, 0) + 1
+
+            # Publish assembled arrays to RobotState
+            self._publish_feedback_if_any()
         return _cb
 
     async def _start_all(self):
@@ -454,19 +498,18 @@ def udp_telemetry_sender(state: RobotState):
         ctrl_ip = state.get_controller_ip()
         if not ctrl_ip:
             continue
-        # Only send when we have real feedback available (no fallback to commands)
         fb_pos, fb_vel = state.get_feedback()
-        if not (isinstance(fb_pos, list) and len(fb_pos) == 6 and
-                isinstance(fb_vel, list) and len(fb_vel) == 6):
-            # Skip sending until first valid feedback arrives
+        # Build payload with available fields only
+        payload = {"t": time.time()}
+        if isinstance(fb_pos, list) and len(fb_pos) == 6:
+            payload["pos"] = [None if v is None else float(v) for v in fb_pos]
+        if isinstance(fb_vel, list) and len(fb_vel) == 6:
+            payload["vel"] = [None if v is None else float(v) for v in fb_vel]
+        if "pos" not in payload and "vel" not in payload:
+            # No feedback yet; wait
             continue
-        msg = {
-            "t": time.time(),
-            "pos": [float(x) for x in fb_pos],
-            "vel": [float(x) for x in fb_vel],
-        }
         try:
-            sock.sendto(json.dumps(msg).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
+            sock.sendto(json.dumps(payload).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
         except Exception as e:
             logger.error(f"[UDP] Telemetry send error: {e}")
 
