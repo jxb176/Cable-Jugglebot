@@ -211,15 +211,29 @@ def axes_state_logger(state: RobotState):
         time.sleep(1.0)
 
 
+# Fallback: define a no-op ODriveCANBridge if the real one isn't present
+try:
+    ODriveCANBridge  # type: ignore[name-defined]
+except NameError:
+    class ODriveCANBridge(threading.Thread):
+        """No-op ODrive bridge so the server can run without drive I/O."""
+        def __init__(self, state):
+            super().__init__(daemon=True)
+            self._stop = threading.Event()
+        def stop(self):
+            self._stop.set()
+        def run(self):
+            try:
+                logger.info("ODriveCANBridge stub active (no CAN I/O)")
+            except Exception:
+                print("ODriveCANBridge stub active (no CAN I/O)")
+            while not self._stop.is_set():
+                time.sleep(0.5)
+
 if __name__ == "__main__":
     state = RobotState()
 
-    # Ensure CAN interface is up before starting ODrive bridge
-    can_ok = ensure_can_interface_up(ODRIVE_INTERFACE, ODRIVE_BITRATE)
-    if not can_ok:
-        logger.warning(f"[CAN] Continuing without {ODRIVE_INTERFACE} being UP (ODrive bridge may run in simulation or fail)")
-
-    # Start ODrive CAN bridge (async driver + feedback logging)
+    # Start ODrive CAN bridge (real or stub)
     odrv_bridge = ODriveCANBridge(state)
     odrv_bridge.start()
 
