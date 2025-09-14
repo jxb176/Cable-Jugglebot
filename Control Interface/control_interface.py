@@ -627,31 +627,42 @@ class RobotGUI(QWidget):
 #     ...
 
 if __name__ == "__main__":
-    # Helpful: print unhandled exceptions instead of silently dying
+    # Ensure unhandled exceptions surface in terminal
     def _excepthook(exc_type, exc, tb):
         import traceback
         traceback.print_exception(exc_type, exc, tb)
     sys.excepthook = _excepthook
 
-    # Create the Qt app first
+    # Create Qt app first
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
+    # Queues
     cmd_queue = Queue(maxsize=1)
     telem_queue = Queue()
 
     # Build and show GUI immediately
     gui = RobotGUI(cmd_queue, telem_queue)
-    gui.status_label.setText("Starting...")
+    gui.status_label.setText("Starting GUI...")
     gui.show()
     gui.raise_()
     gui.activateWindow()
-    print("[GUI] Shown")
+    print("[GUI] Window shown")
 
-    # Defer starting background threads until the event loop starts
+    # Periodic “alive” indicator
+    def _alive_tick():
+        # Update the title subtly so you can see it refreshing
+        gui.setWindowTitle(f"Robot Controller + Telemetry  (alive {int(time.time())})")
+        print("[GUI] alive", time.strftime("%H:%M:%S"))
+    alive_timer = QTimer()
+    alive_timer.timeout.connect(_alive_tick)
+    alive_timer.start(2000)  # every 2s
+
+    # Start background threads AFTER the event loop starts
+    _threads = {}
+
     def _start_background():
-        print("[BG] Starting threads")
-
+        print("[BG] Starting background threads")
         # Telemetry listener (UDP)
         telem_thread = threading.Thread(
             target=telemetry_listener,
@@ -659,6 +670,7 @@ if __name__ == "__main__":
             daemon=True,
         )
         telem_thread.start()
+        _threads["telem_thread"] = telem_thread
 
         # TCP command client
         cmd_client = CommandClient(
@@ -666,12 +678,24 @@ if __name__ == "__main__":
         )
         cmd_client.daemon = True
         cmd_client.start()
+        _threads["cmd_client"] = cmd_client
 
         gui.status_label.setText("Ready")
+        print("[BG] Threads started")
 
-    from PyQt6.QtCore import QTimer
     QTimer.singleShot(0, _start_background)
 
-    # Enter Qt event loop
+    # Graceful shutdown
+    def _on_quit():
+        print("[QUIT] Stopping background threads")
+        client = _threads.get("cmd_client")
+        if client:
+            try:
+                client.stop()
+            except Exception:
+                pass
+        # telem_thread is daemon; no join needed
+    app.aboutToQuit.connect(_on_quit)
+
     print("[GUI] Entering event loop")
     sys.exit(app.exec())
