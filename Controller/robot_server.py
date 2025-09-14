@@ -192,7 +192,7 @@ def tcp_command_server(state: RobotState):
 def udp_telemetry_sender(state: RobotState):
     """Sends telemetry to the controller IP over UDP at 10 Hz."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    while True: a t
+    while True:
         time.sleep(0.1)
         ctrl_ip = state.get_controller_ip()
         if not ctrl_ip:
