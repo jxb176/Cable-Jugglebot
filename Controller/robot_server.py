@@ -19,6 +19,8 @@ ODRIVE_BITRATE = 1_000_000           # 1 Mbps
 AXIS_NODE_IDS = [0, 1, 2, 3, 4, 5]
 ODRIVE_COMMAND_RATE_HZ = 200.0
 ODRIVE_LOG_RATE_HZ = 2.0
+# Ensure env var for libraries that require CAN_CHANNEL
+os.environ.setdefault("CAN_CHANNEL", ODRIVE_INTERFACE)
 
 try:
     import odrive_can as odc
@@ -263,7 +265,8 @@ class ODriveCANBridge(threading.Thread):
         can_bus = None
         try:
             import can  # python-can
-            can_bus = can.interface.Bus(channel=ODRIVE_INTERFACE, bustype="socketcan")
+            # Use 'interface' kw (bustype is deprecated in recent python-can)
+            can_bus = can.interface.Bus(interface="socketcan", channel=ODRIVE_INTERFACE)
             logger.info(f"[CAN] python-can bus created for {ODRIVE_INTERFACE}")
         except Exception as e:
             logger.warning(f"[CAN] Could not create python-can bus for {ODRIVE_INTERFACE}: {e}")
@@ -277,19 +280,16 @@ class ODriveCANBridge(threading.Thread):
                 if can_bus is not None:
                     # Prefer passing an actual bus object
                     ctor_attempts.append(("kw axis_id+busObj", lambda: odc.ODriveCAN(axis_id=aid, bus=can_bus)))
-                # Fallbacks (may work on other versions)
+                # Fallbacks that rely on env var CAN_CHANNEL
                 ctor_attempts.extend([
-                    ("kw axis_id+channel",        lambda: odc.ODriveCAN(axis_id=aid, channel=ODRIVE_INTERFACE)),
-                    ("pos (axis_id, interface)",  lambda: odc.ODriveCAN(aid, ODRIVE_INTERFACE)),  # may pass str (not ideal)
-                    ("pos (axis_id,)",            lambda: odc.ODriveCAN(aid)),
-                    ("kw axis_id only",           lambda: odc.ODriveCAN(axis_id=aid)),
+                    ("kw axis_id only (env CAN_CHANNEL)", lambda: odc.ODriveCAN(axis_id=aid)),
                 ])
 
                 for label, factory in ctor_attempts:
                     try:
                         drv = factory()
                         logger.info(f"ODrive axis {aid}: constructed with '{label}'")
-                        # sanity check: avoid keeping a driver if its internal bus is a str
+                        # Sanity check: avoid keeping a driver if its internal bus is a str
                         if hasattr(drv, "_bus") and isinstance(getattr(drv, "_bus"), str):
                             raise TypeError("Driver _bus is str; expected bus object")
                         break
@@ -383,9 +383,14 @@ class ODriveCANBridge(threading.Thread):
 
 
 def tcp_command_server(state: RobotState):
+    """Accepts a single TCP client, receives newline-delimited JSON commands."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", TCP_CMD_PORT))
+    try:
+        srv.bind(("0.0.0.0", TCP_CMD_PORT))
+    except OSError as e:
+        logger.error(f"[TCP] Bind failed on :{TCP_CMD_PORT} ({e}). Another instance running? Server thread exiting.")
+        return
     srv.listen(1)
     logger.info(f"[TCP] Listening on :{TCP_CMD_PORT}")
     while True:
