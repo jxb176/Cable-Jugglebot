@@ -1,9 +1,13 @@
-# robot_server.py
+import sys
+import threading
+import time
+import random
+from queue import Queue
 import socket
 import json
-import time
-import threading
-import random
+import os
+import csv
+import base64
 
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
@@ -179,6 +183,8 @@ def tcp_command_server(state: RobotState):
                         elif mtype == "profile_stop":
                             state.stop_profile()
                             print("[PROFILE] Stopped")
+                        elif mtype == "log_request":
+                            _send_log_file(conn)  # blocking call
                         else:
                             print("[TCP] Unknown command type:", mtype)
                     except Exception as e:
@@ -188,6 +194,26 @@ def tcp_command_server(state: RobotState):
         finally:
             state.stop_profile()
             print("[TCP] Controller disconnected")
+
+def _send_log_file(sock):
+    """Sends the server log file over the socket, base64 encoded."""
+    try:
+        log_path = os.path.abspath("robot_server.py")  # Path to this file (as log)
+        if not os.path.exists(log_path):
+            print("[LOG] No server log file")
+            return
+        with open(log_path, "rb") as f:
+            data = f.read()
+        data_b64 = base64.b64encode(data).decode("ascii")
+        msg = {
+            "type": "log_file",
+            "filename": "robot_server.py",
+            "data_b64": data_b64,
+        }
+        sock.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+        print("[LOG] Sent server log file")
+    except Exception as e:
+        print("[LOG] Error sending server log:", e)
 
 def udp_telemetry_sender(state: RobotState):
     """Sends telemetry to the controller IP over UDP at 10 Hz."""
@@ -227,3 +253,149 @@ if __name__ == "__main__":
     print("Robot server running. Press Ctrl+C to exit.")
     while True:
         time.sleep(1)
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QPushButton,
+    QLabel, QSlider, QHBoxLayout, QDoubleSpinBox, QComboBox
+)
+
+def _queue_put_latest(q: Queue, value):
+    """Replace existing queue contents with new value"""
+    with q.mutex:
+        q.queue.clear()
+    q.put_nowait(value)
+
+
+class CommandClient(threading.Thread):
+    """TCP client that reliably sends commands to the robot with auto-reconnect."""
+    def __init__(self, host, port, cmd_queue: Queue, status_cb=None):
+        super().__init__(daemon=True)
+        self.host = host
+        self.port = port
+        self.cmd_queue = cmd_queue
+        self.status_cb = status_cb
+        self._stop = threading.Event()
+        self._sock = None
+        self._rx_thread = None
+
+    def run(self):
+        last_cmd = None
+        while not self._stop.is_set():
+            try:
+                if self.status_cb:
+                    self.status_cb("Connecting to robot (TCP)...")
+                self._sock = socket.create_connection((self.host, self.port), timeout=5)
+                self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if self.status_cb:
+                    self.status_cb("Connected (TCP)")
+
+                # Start receiver thread
+                self._rx_thread = threading.Thread(target=self._recv_loop, daemon=True)
+                self._rx_thread.start()
+
+                if last_cmd is not None:
+                    self._send_cmd(last_cmd)
+
+                while not self._stop.is_set():
+                    cmd = self.cmd_queue.get()
+                    last_cmd = cmd
+                    self._send_cmd(cmd)
+            except Exception as e:
+                if self.status_cb:
+                    self.status_cb(f"TCP disconnected: {e}. Reconnecting in 1s...")
+                self._close()
+                time.sleep(1)
+        self._close()
+
+    def _recv_loop(self):
+        try:
+            f = self._sock.makefile("r")
+            for line in f:
+                try:
+                    msg = json.loads(line.strip())
+                    mtype = msg.get("type")
+                    if mtype == "log_file":
+                        self._handle_log_file(msg)
+                    else:
+                        # Other server-originated messages could be handled here
+                        pass
+                except Exception as e:
+                    if self.status_cb:
+                        self.status_cb(f"RX parse error: {e}")
+        except Exception as e:
+            if self.status_cb:
+                self.status_cb(f"RX error: {e}")
+
+    def _handle_log_file(self, msg: dict):
+        try:
+            fname = msg.get("filename", "robot.log")
+            data_b64 = msg.get("data_b64", "")
+            data = base64.b64decode(data_b64.encode("ascii"))
+            logs_dir = os.path.join(os.getcwd(), "Logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            out_path = os.path.join(logs_dir, fname)
+            with open(out_path, "wb") as f:
+                f.write(data)
+            if self.status_cb:
+                self.status_cb(f"Saved log to {out_path}")
+        except Exception as e:
+            if self.status_cb:
+                self.status_cb(f"Failed to save log: {e}")
+
+    def _send_cmd(self, cmd_value):
+        if not self._sock:
+            return
+        if not isinstance(cmd_value, dict):
+            return
+        msg = json.dumps(cmd_value) + "\n"
+        self._sock.sendall(msg.encode("utf-8"))
+
+    def stop(self):
+        self._stop.set()
+        self._close()
+
+    def _close(self):
+        try:
+            if self._sock:
+                self._sock.close()
+        except Exception:
+            pass
+        self._sock = None
+class RobotGUI(QWidget):
+    def __init__(self, cmd_queue, telem_queue):
+        super().__init__()
+        self.setWindowTitle("Robot Controller + Telemetry")
+        self.resize(800, 600)
+        # ... existing code ...
+
+        # Profile controls: dropdown + send + start + rate + fetch log
+        prof_layout = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        self.profile_refresh_btn = QPushButton("Refresh")
+        self.profile_send_btn = QPushButton("Send Profile")
+        self.profile_rate = QDoubleSpinBox()
+        self.profile_rate.setDecimals(1)
+        self.profile_rate.setRange(1.0, 1000.0)
+        self.profile_rate.setSingleStep(10.0)
+        self.profile_rate.setValue(100.0)
+        self.profile_start_btn = QPushButton("Start Profile")
+        self.profile_fetch_log_btn = QPushButton("Fetch Log")
+        self.profile_refresh_btn.clicked.connect(self.populate_profile_dropdown)
+        self.profile_send_btn.clicked.connect(self.on_send_profile)
+        self.profile_start_btn.clicked.connect(self.on_start_profile)
+        self.profile_fetch_log_btn.clicked.connect(self.on_fetch_log)
+        prof_layout.addWidget(QLabel("Profile CSV:"))
+        prof_layout.addWidget(self.profile_combo, 1)
+        prof_layout.addWidget(self.profile_refresh_btn)
+        prof_layout.addWidget(self.profile_send_btn)
+        prof_layout.addWidget(QLabel("Rate (Hz):"))
+        prof_layout.addWidget(self.profile_rate)
+        prof_layout.addWidget(self.profile_start_btn)
+        prof_layout.addWidget(self.profile_fetch_log_btn)
+        layout.addLayout(prof_layout)
+        # ... existing code ...
+
+    def on_fetch_log(self):
+        """Request the current log file from the robot server."""
+        cmd = {"type": "log_request"}
+        _queue_put_latest(self.cmd_queue, cmd)
+        self.status_label.setText("Log requested from robot")
