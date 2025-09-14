@@ -204,13 +204,20 @@ class RobotGUI(QWidget):
         self.ydata = []
         self.start_time = time.time()
 
-        # Initialize profile dropdown
+        # Initialize profile dropdown (Profiles subfolder)
         self.populate_profile_dropdown()
 
         # Timer to refresh GUI
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_gui)
         self.timer.start(100)  # update every 100 ms
+
+    def _profiles_dir(self) -> str:
+        """Return absolute path to the Profiles subfolder, creating it if missing."""
+        base = os.getcwd()
+        pdir = os.path.join(base, "Profiles")
+        os.makedirs(pdir, exist_ok=True)
+        return pdir
 
     def send_axes(self, *_):
         """Send 6-axis position command in turns."""
@@ -223,64 +230,56 @@ class RobotGUI(QWidget):
         cmd = {"type": "state", "value": state_value}
         _queue_put_latest(self.cmd_queue, cmd)
 
-    def send_command(self, value):
-        """Deprecated: retained for compatibility; prefer send_axes/send_state."""
-        # No-op or translate if needed. Here we just ignore non-dict to avoid speed usage.
-        if isinstance(value, dict):
-            _queue_put_latest(self.cmd_queue, value)
-
-    def populate_profile_dropdown(self):
-        """Scan current directory for CSV files and populate the dropdown."""
-        cwd = os.getcwd()
-        csvs = sorted([f for f in os.listdir(cwd) if f.lower().endswith(".csv")])
-        self.profile_combo.clear()
-        if not csvs:
-            self.profile_combo.addItem("(no .csv files found)")
-            self.profile_combo.setEnabled(False)
-        else:
-            self.profile_combo.setEnabled(True)
-            for f in csvs:
-                self.profile_combo.addItem(f)
-
-    def _load_csv_as_profile(self, path):
-        """Load CSV: rows -> [t, a1..a6]. Returns a list of lists."""
-        profile_rows = []
+    def _load_csv_as_profile(self, path: str):
+        """Load CSV profile with rows: time, axis1..axis6."""
+        rows = []
         with open(path, "r", newline="") as f:
             reader = csv.reader(f)
             rows = [r for r in reader if any(cell.strip() for cell in r)]
         if not rows:
             raise ValueError("empty CSV")
-
         # Skip header if first cell not numeric
         start_idx = 0
         try:
             float(rows[0][0])
         except Exception:
             start_idx = 1
-
+        profile_rows = []
         for r in rows[start_idx:]:
             if len(r) < 7:
                 raise ValueError("each row must have at least 7 columns: time + 6 axes")
             t = float(r[0])
             axes = [float(x) for x in r[1:7]]
             profile_rows.append([t] + axes)
-
         # Ensure monotonic non-decreasing time
         times = [row[0] for row in profile_rows]
         if any(t2 < t1 for t1, t2 in zip(times, times[1:])):
             raise ValueError("time column must be non-decreasing")
         return profile_rows
 
+    def populate_profile_dropdown(self):
+        """Scan Profiles subdirectory for CSV files and populate the dropdown."""
+        pdir = self._profiles_dir()
+        csvs = sorted([f for f in os.listdir(pdir) if f.lower().endswith(".csv")])
+        self.profile_combo.clear()
+        if not csvs:
+            self.profile_combo.addItem("(no .csv files in Profiles/)")
+            self.profile_combo.setEnabled(False)
+        else:
+            self.profile_combo.setEnabled(True)
+            for f in csvs:
+                self.profile_combo.addItem(f)
+
     def on_send_profile(self):
-        """Parse selected CSV and send it to the robot server."""
+        """Parse selected CSV from Profiles and send it to the robot server."""
         if not self.profile_combo.isEnabled():
-            self.status_label.setText("No CSV profile to send")
+            self.status_label.setText("No CSV profile to send (Profiles/ empty)")
             return
         fname = self.profile_combo.currentText()
         if not fname or fname.startswith("("):
             self.status_label.setText("Select a valid CSV profile")
             return
-        path = os.path.join(os.getcwd(), fname)
+        path = os.path.join(self._profiles_dir(), fname)
         try:
             profile_rows = self._load_csv_as_profile(path)
             cmd = {"type": "profile_upload", "profile": profile_rows}
