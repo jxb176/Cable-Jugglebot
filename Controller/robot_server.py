@@ -339,62 +339,38 @@ class ODriveCANBridge(threading.Thread):
         else:
             logger.info(f"[ODRV] drivers initialized: {[aid for aid, _ in self._drivers]}")
 
-    def _on_feedback(self, axis_id, fb):
+    def _on_feedback(self, axis_id: int, fb):
         """
-        Converts odrive_can feedback to pos/vel and stores in RobotState.
-        Handles multiple formats: scalar, tuple/list, dict.
+        Handle feedback from a single axis.
+
+        axis_id: integer 0..5 (captured in lambda)
+        fb: feedback object from odrive_can (usually a dict with keys like 'Pos_Estimate', 'Vel_Estimate')
         """
         try:
+            # Validate axis_id
+            if not isinstance(axis_id, int) or not (0 <= axis_id < 6):
+                logger.warning(f"[ODRV] _on_feedback received invalid axis_id: {axis_id}")
+                return
+
+            # Extract position and velocity safely
             pos_val = None
             vel_val = None
 
-            # dict feedback
+            # Feedback is usually a dict
             if isinstance(fb, dict):
-                pos_keys = ("pos", "position", "position_estimate", "position_raw")
-                vel_keys = ("vel", "velocity", "vel_estimate", "velocity_raw")
-                for k in pos_keys:
-                    if k in fb and fb[k] is not None:
-                        pos_val = fb[k]
-                        break
-                for k in vel_keys:
-                    if k in fb and fb[k] is not None:
-                        vel_val = fb[k]
-                        break
-                # flatten lists
-                if isinstance(pos_val, (list, tuple)) and pos_val:
-                    pos_val = pos_val[0]
-                if isinstance(vel_val, (list, tuple)) and vel_val:
-                    vel_val = vel_val[0]
+                pos_val = fb.get("Pos_Estimate")
+                vel_val = fb.get("Vel_Estimate")
+            else:
+                logger.warning(f"[ODRV] _on_feedback received unexpected feedback type: {type(fb)}")
+                return
 
-            # tuple/list feedback
-            elif isinstance(fb, (list, tuple)):
-                if len(fb) >= 1:
-                    pos_val = fb[0]
-                if len(fb) >= 2:
-                    vel_val = fb[1]
+            # Update RobotState only if we have valid numbers
+            if pos_val is not None or vel_val is not None:
+                self.state.set_axis_feedback(axis_id, pos_estimate=pos_val, vel_estimate=vel_val)
+                self._feedback_seen[axis_id] += 1
 
-            # scalar feedback
-            elif isinstance(fb, (int, float)):
-                pos_val = float(fb)
-
-            # convert to float safely
-            try:
-                pos_val = float(pos_val) if pos_val is not None else None
-            except Exception:
-                pos_val = None
-            try:
-                vel_val = float(vel_val) if vel_val is not None else None
-            except Exception:
-                vel_val = None
-
-            # store in RobotState
-            self.state.set_axis_feedback(axis_id, pos_estimate=pos_val, vel_estimate=vel_val)
-
-            # count feedback seen
-            self._feedback_seen[axis_id] = self._feedback_seen.get(axis_id, 0) + 1
-
-        except Exception:
-            logger.exception(f"[ODRV] Exception in _on_feedback for axis {axis_id}")
+        except Exception as e:
+            logger.exception(f"[ODRV] Exception in _on_feedback for axis {axis_id}: {e}")
 
     async def _apply_state(self, st: str):
         """Apply high-level state (enable/disable/estop) to all axes."""
