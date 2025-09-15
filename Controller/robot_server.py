@@ -9,6 +9,7 @@ import logging
 from datetime import datetime
 import subprocess
 import asyncio  # <-- make asyncio available at module scope
+from typing import List, Tuple, Optional
 
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
@@ -240,10 +241,34 @@ class RobotState:
 class ProfilePlayer(threading.Thread):
     """Plays a time-position profile with linear interpolation at fixed rate."""
 
+    def __init__(self, state: RobotState, profile: List[Tuple[float, List[float]]], rate_hz: float):
+        super().__init__(daemon=True)
+        self.state = state
+        self._stop = threading.Event()
+        if rate_hz <= 0:
+            raise ValueError("rate_hz must be > 0")
+        self.dt = 1.0 / rate_hz
+
+        # Normalize profile times so playback starts at t=0
+        if not profile:
+            raise ValueError("empty profile")
+        t0 = float(profile[0][0])
+        norm = []
+        for t, axes in profile:
+            norm.append((float(t) - t0, [float(x) for x in axes]))
+        self.norm_profile = norm
+        self.duration = norm[-1][0] if norm else 0.0
+
     def stop(self):
         self._stop.set()
 
     def run(self):
+        if self.duration <= 0.0:
+            # immediate set and exit
+            self.state.set_axes(self.norm_profile[-1][1])
+            logger.info("[PROFILE] Zero-duration profile applied")
+            return
+
         logger.info(f"[PROFILE] Starting playback at {1.0/self.dt:.1f} Hz, duration {self.duration:.3f}s")
         start = time.perf_counter()
         k = 0
@@ -253,8 +278,11 @@ class ProfilePlayer(threading.Thread):
                 self.state.set_axes(self.norm_profile[-1][1])
                 logger.info("[PROFILE] Completed")
                 break
-            while k + 1 < len(self.norm_profile) and self.norm_profile[k + 1][0] < t:
+
+            # advance segment index
+            while k + 1 < len(self.norm_profile) and self.norm_profile[k + 1][0] <= t:
                 k += 1
+
             t0, p0 = self.norm_profile[k]
             t1, p1 = self.norm_profile[min(k + 1, len(self.norm_profile) - 1)]
             if t1 <= t0:
@@ -262,8 +290,13 @@ class ProfilePlayer(threading.Thread):
             else:
                 alpha = max(0.0, min(1.0, (t - t0) / (t1 - t0)))
             axes = [p0[i] + alpha * (p1[i] - p0[i]) for i in range(6)]
-            self.state.set_axes(axes)
+            try:
+                self.state.set_axes(axes)
+            except Exception as e:
+                logger.error(f"[PROFILE] set_axes error: {e}")
             time.sleep(self.dt)
+
+        # cleanup: clear player_thread reference if still pointing to us
         with self.state.lock:
             if self.state.player_thread is self:
                 self.state.player_thread = None
@@ -276,27 +309,58 @@ class ODriveCANBridge(threading.Thread):
         self.state = state
         self._stop = threading.Event()
         self._drivers = []              # list[(axis_id, drv)]
-        self._last_state = None
         self._applied_state_version = -1
         self._last_log = 0.0
         self._feedback_seen = {aid: 0 for aid in AXIS_NODE_IDS}
         self._last_enable_retry = 0.0  # retry timer
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+
+    # Public stop() to be called from main thread
+    def stop(self):
+        logger.info("[ODRV] stop() called")
+        self._stop.set()
+        # if an event loop is running in this thread, stop it safely
+        if self.loop and self.loop.is_running():
+            try:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            except Exception as e:
+                logger.debug(f"[ODRV] loop.stop failed: {e}")
 
     async def _start_all(self):
-        # ... existing driver init ...
+        """Initialize drivers if odrive_can is present. If not, keep empty drivers (simulation)."""
+        if odc is None:
+            logger.warning("[ODRV] odrive_can not available; running in simulation mode")
+            self._drivers = []  # keep empty -> _stream_positions will run a simulated loop
+        else:
+            # Example: discover drivers using odrive_can API (pseudo-code; adapt to real API)
+            try:
+                drivers = []
+                for aid in AXIS_NODE_IDS:
+                    try:
+                        drv = odc.get_driver(aid)  # <-- hypothetical; replace with real odrive_can call
+                        drivers.append((aid, drv))
+                        logger.info(f"[ODRV] found driver for axis {aid}")
+                    except Exception as e:
+                        logger.warning(f"[ODRV] axis {aid} driver init failed: {e}")
+                self._drivers = drivers
+            except Exception as e:
+                logger.exception(f"[ODRV] driver discovery failed: {e}")
+                self._drivers = []
+
         logger.info("[TRACE] ODriveCANBridge: start_all completed; drivers=%s",
                     [aid for aid, _ in self._drivers])
 
     async def _apply_state(self, st: str):
         if not self._drivers:
-            logger.warning("[TRACE] _apply_state called but no drivers are started")
+            logger.warning("[TRACE] _apply_state called but no drivers are started (simulation)")
             return
         try:
             if st == "enable":
                 for idx, (aid, drv) in enumerate(self._drivers):
                     # Optional: clear/inspect errors before enabling
                     try:
-                        drv.check_errors()
+                        if hasattr(drv, "check_errors"):
+                            drv.check_errors()
                     except Exception as e:
                         logger.debug(f"[TRACE] axis {aid}: check_errors raised: {e}")
                     if hasattr(drv, "clear_errors"):
@@ -305,7 +369,6 @@ class ODriveCANBridge(threading.Thread):
                         except Exception:
                             pass
 
-                    # TRACE: prove we reached the call
                     logger.info(f"[TRACE] axis {aid}: calling set_axis_state('CLOSED_LOOP_CONTROL')")
                     try:
                         await drv.set_axis_state("CLOSED_LOOP_CONTROL")
@@ -377,15 +440,55 @@ class ODriveCANBridge(threading.Thread):
                 logger.info(f"[ODRV] feedback counts: {summary if summary else 'no drivers'}")
                 last_log = now
 
+            # If we have no real drivers, run a light simulated loop (and keep loop responsive)
+            if not self._drivers:
+                logger.debug("[ODRV] simulation loop tick")
+                # Optionally update fake feedback here if desired:
+                await asyncio.sleep(0.05)
+                continue
+
             await asyncio.sleep(0.002)
-            logger.warning("ODrive bridge running in simulation mode (odrive_can missing)")
-            while not self._stop.is_set():
-                time.sleep(0.5)
-            return
+
+        logger.info("[ODRV] _stream_positions exit (stop requested)")
+
+    async def _run_async(self):
+        """Main async entry point executed in the thread's event loop."""
+        await self._start_all()
         try:
-            asyncio.run(self._run_async())
+            await self._stream_positions()
+        except asyncio.CancelledError:
+            logger.info("[ODRV] _run_async cancelled")
+        except Exception as e:
+            logger.exception(f"[ODRV] exception in _run_async: {e}")
+        finally:
+            # attempt graceful shutdown of drivers if any
+            if self._drivers:
+                try:
+                    for aid, drv in self._drivers:
+                        if hasattr(drv, "set_axis_state"):
+                            try:
+                                await drv.set_axis_state("IDLE")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            logger.info("[ODRV] _run_async finished")
+
+    def run(self):
+        """Thread run: create a dedicated asyncio loop and run the async entry."""
+        try:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            # run until _run_async completes or loop is stopped
+            self.loop.run_until_complete(self._run_async())
         except Exception as e:
             logger.error(f"ODrive asyncio loop error: {e}")
+        finally:
+            try:
+                self.loop.close()
+            except Exception:
+                pass
+            logger.info("[ODRV] Bridge thread exiting")
 
 
 def tcp_command_server(state: RobotState):
