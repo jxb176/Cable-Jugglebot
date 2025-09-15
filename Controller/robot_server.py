@@ -320,6 +320,8 @@ class ODriveCANBridge(threading.Thread):
         self._stop.set()
 
     async def _start_all(self):
+        logger.info(f"[ODRV] Created ODriveCAN driver: axis_id={axis_id}, drv={drv}")
+
         """Initialize all ODriveCAN drivers and attach feedback callbacks."""
         if odc is None:
             logger.warning("[ODRV] odrive_can module missing; running in simulation mode")
