@@ -413,17 +413,50 @@ class ODriveCANBridge(threading.Thread):
             return
         try:
             if st == "enable":
-                for _, drv in self._drivers:
-                    await drv.set_axis_state("CLOSED_LOOP_CONTROL")
+                for idx, (aid, drv) in enumerate(self._drivers):
+                    # TRACE: before attempting to enable
+                    logger.info(f"[TRACE] enabling axis {aid}: calling set_axis_state('CLOSED_LOOP_CONTROL')")
+                    try:
+                        await drv.set_axis_state("CLOSED_LOOP_CONTROL")
+                        logger.info(f"[TRACE] enabling axis {aid}: set_axis_state returned OK")
+                    except Exception as e:
+                        logger.exception(f"[TRACE] enabling axis {aid}: set_axis_state raised: {e}")
+                        continue
+
+                    # Optionally send an initial setpoint to confirm control loop is active
+                    try:
+                        cmd = self.state.get_axes()
+                        init_setp = float(cmd[idx]) if idx < len(cmd) else 0.0
+                        drv.set_input_pos(init_setp)
+                        logger.info(f"[TRACE] enabling axis {aid}: initial set_input_pos({init_setp}) sent")
+                    except Exception as e:
+                        logger.warning(f"[TRACE] enabling axis {aid}: initial set_input_pos failed: {e}")
+
+                    # If available, verify current state
+                    if hasattr(drv, "get_axis_state"):
+                        try:
+                            cur = await drv.get_axis_state()
+                            logger.info(f"[TRACE] enabling axis {aid}: get_axis_state() -> {cur}")
+                        except Exception as e:
+                            logger.debug(f"[TRACE] enabling axis {aid}: get_axis_state failed: {e}")
+
             elif st == "disable":
-                for _, drv in self._drivers:
-                    await drv.set_axis_state("IDLE")
-            elif st == "estop":
-                for _, drv in self._drivers:
+                for aid, drv in self._drivers:
+                    logger.info(f"[TRACE] disabling axis {aid}: calling set_axis_state('IDLE')")
                     try:
                         await drv.set_axis_state("IDLE")
-                    except Exception:
-                        pass
+                        logger.info(f"[TRACE] disabling axis {aid}: set_axis_state returned OK")
+                    except Exception as e:
+                        logger.exception(f"[TRACE] disabling axis {aid}: set_axis_state raised: {e}")
+
+            elif st == "estop":
+                for aid, drv in self._drivers:
+                    logger.info(f"[TRACE] estop axis {aid}: calling set_axis_state('IDLE')")
+                    try:
+                        await drv.set_axis_state("IDLE")
+                        logger.info(f"[TRACE] estop axis {aid}: set_axis_state returned OK")
+                    except Exception as e:
+                        logger.exception(f"[TRACE] estop axis {aid}: set_axis_state raised: {e}")
         except Exception as e:
             logger.error(f"Failed applying state '{st}' to ODrive: {e}")
 
