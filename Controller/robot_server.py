@@ -304,111 +304,74 @@ class ProfilePlayer(threading.Thread):
 
 class ODriveCANBridge(threading.Thread):
     """Streams axes targets to ODrive over CAN (async) and logs feedback callbacks."""
+
     def __init__(self, state: RobotState):
         super().__init__(daemon=True)
         self.state = state
         self._stop = threading.Event()
         self._drivers = []              # list[(axis_id, drv)]
         self._applied_state_version = -1
-        self._last_log = 0.0
-        self._feedback_seen = {aid: 0 for aid in AXIS_NODE_IDS}
-        self._last_enable_retry = 0.0  # retry timer
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
 
-    # Public stop() to be called from main thread
     def stop(self):
-        logger.info("[ODRV] stop() called")
         self._stop.set()
-        # if an event loop is running in this thread, stop it safely
-        if self.loop and self.loop.is_running():
-            try:
-                self.loop.call_soon_threadsafe(self.loop.stop)
-            except Exception as e:
-                logger.debug(f"[ODRV] loop.stop failed: {e}")
 
     async def _start_all(self):
-        """Initialize drivers if odrive_can is present. If not, keep empty drivers (simulation)."""
-        if odc is None:
-            logger.warning("[ODRV] odrive_can not available; running in simulation mode")
-            self._drivers = []  # keep empty -> _stream_positions will run a simulated loop
-        else:
-            # Example: discover drivers using odrive_can API (pseudo-code; adapt to real API)
+        """Create and start all ODriveCAN driver instances."""
+        for aid in AXIS_NODE_IDS:
             try:
-                drivers = []
-                for aid in AXIS_NODE_IDS:
-                    try:
-                        drv = odc.get_driver(aid)  # <-- hypothetical; replace with real odrive_can call
-                        drivers.append((aid, drv))
-                        logger.info(f"[ODRV] found driver for axis {aid}")
-                    except Exception as e:
-                        logger.warning(f"[ODRV] axis {aid} driver init failed: {e}")
-                self._drivers = drivers
-            except Exception as e:
-                logger.exception(f"[ODRV] driver discovery failed: {e}")
-                self._drivers = []
+                drv = odc.ODriveCAN(axis_id=aid)
 
-        logger.info("[TRACE] ODriveCANBridge: start_all completed; drivers=%s",
-                    [aid for aid, _ in self._drivers])
+                # Hook up feedback callback
+                drv.feedback_callback = lambda fb, axis=aid: self._on_feedback(axis, fb)
+
+                # Must start the async driver
+                await drv.start()
+
+                self._drivers.append((aid, drv))
+                logger.info(f"[ODRV] axis {aid} driver started")
+            except Exception as e:
+                logger.warning(f"[ODRV] axis {aid} driver init failed: {e}")
+
+    def _on_feedback(self, axis_id, fb):
+        """Called by driver when feedback arrives."""
+        try:
+            pos = fb.get("pos", None)
+            vel = fb.get("vel", None)
+            self.state.set_axis_feedback(axis_id, pos_estimate=pos, vel_estimate=vel)
+            # Track counts if you like
+        except Exception as e:
+            logger.debug(f"[ODRV] feedback handler error: {e}")
 
     async def _apply_state(self, st: str):
+        """Apply high-level state (enable/disable/estop) to all axes."""
         if not self._drivers:
-            logger.warning("[TRACE] _apply_state called but no drivers are started (simulation)")
             return
+
         try:
             if st == "enable":
                 for idx, (aid, drv) in enumerate(self._drivers):
-                    # Optional: clear/inspect errors before enabling
-                    try:
-                        if hasattr(drv, "check_errors"):
-                            drv.check_errors()
-                    except Exception as e:
-                        logger.debug(f"[TRACE] axis {aid}: check_errors raised: {e}")
-                    if hasattr(drv, "clear_errors"):
-                        try:
-                            drv.clear_errors()
-                        except Exception:
-                            pass
-
-                    logger.info(f"[TRACE] axis {aid}: calling set_axis_state('CLOSED_LOOP_CONTROL')")
+                    logger.info(f"[ODRV] axis {aid}: enabling CLOSED_LOOP_CONTROL")
                     try:
                         await drv.set_axis_state("CLOSED_LOOP_CONTROL")
-                        logger.info(f"[TRACE] axis {aid}: set_axis_state returned OK")
-                    except Exception as e:
-                        logger.exception(f"[TRACE] axis {aid}: set_axis_state raised: {e}")
-                        continue
-
-                    # Kick with initial setpoint
-                    try:
+                        # Kick with current command
                         cmd = self.state.get_axes()
                         setp = float(cmd[idx]) if idx < len(cmd) else 0.0
                         drv.set_input_pos(setp)
-                        logger.info(f"[TRACE] axis {aid}: initial set_input_pos({setp})")
                     except Exception as e:
-                        logger.debug(f"[TRACE] axis {aid}: initial set_input_pos failed: {e}")
+                        logger.warning(f"[ODRV] axis {aid} enable failed: {e}")
 
-            elif st == "disable":
+            elif st in ("disable", "estop"):
                 for aid, drv in self._drivers:
-                    logger.info(f"[TRACE] axis {aid}: calling set_axis_state('IDLE')")
+                    logger.info(f"[ODRV] axis {aid}: setting IDLE")
                     try:
                         await drv.set_axis_state("IDLE")
-                        logger.info(f"[TRACE] axis {aid}: set_axis_state('IDLE') OK")
                     except Exception as e:
-                        logger.exception(f"[TRACE] axis {aid}: set_axis_state('IDLE') raised: {e}")
-
-            elif st == "estop":
-                # Safe fallback: go to IDLE
-                for aid, drv in self._drivers:
-                    logger.info(f"[TRACE] axis {aid}: estop -> set_axis_state('IDLE')")
-                    try:
-                        await drv.set_axis_state("IDLE")
-                        logger.info(f"[TRACE] axis {aid}: estop->IDLE OK")
-                    except Exception as e:
-                        logger.exception(f"[TRACE] axis {aid}: estop->IDLE raised: {e}")
-
+                        logger.warning(f"[ODRV] axis {aid} disable failed: {e}")
         except Exception as e:
             logger.error(f"[ODRV] _apply_state('{st}') failed: {e}")
 
     async def _stream_positions(self):
+        """Main loop: stream commands + log feedback."""
         dt_cmd = 1.0 / max(1e-3, ODRIVE_COMMAND_RATE_HZ)
         dt_log = 1.0 / max(1e-3, ODRIVE_LOG_RATE_HZ)
         last_cmd = time.perf_counter()
@@ -419,13 +382,12 @@ class ODriveCANBridge(threading.Thread):
             st = self.state.get_state()
             sv = self.state.get_state_version()
 
-            # TRACE: show decision to apply
+            # Handle state change
             if sv != self._applied_state_version:
-                logger.info(f"[TRACE] state change detected: st='{st}', sv={sv}, applied={self._applied_state_version}")
                 await self._apply_state(st)
                 self._applied_state_version = sv
-                logger.info(f"[TRACE] state applied: st='{st}', applied={self._applied_state_version}")
 
+            # Send setpoints if enabled
             if self._drivers and st == "enable" and (now - last_cmd) >= dt_cmd:
                 positions = self.state.get_axes()
                 for i, (aid, drv) in enumerate(self._drivers):
@@ -435,60 +397,25 @@ class ODriveCANBridge(threading.Thread):
                         logger.error(f"[ODRV] axis {aid} set_input_pos failed: {e}")
                 last_cmd = now
 
+            # Periodic log
             if (now - last_log) >= dt_log:
-                summary = ", ".join(f"{aid}:{self._feedback_seen.get(aid,0)}" for aid, _ in self._drivers)
-                logger.info(f"[ODRV] feedback counts: {summary if summary else 'no drivers'}")
+                logger.info(f"[ODRV] streaming {len(self._drivers)} axes, state={st}")
                 last_log = now
-
-            # If we have no real drivers, run a light simulated loop (and keep loop responsive)
-            if not self._drivers:
-                logger.debug("[ODRV] simulation loop tick")
-                # Optionally update fake feedback here if desired:
-                await asyncio.sleep(0.05)
-                continue
 
             await asyncio.sleep(0.002)
 
-        logger.info("[ODRV] _stream_positions exit (stop requested)")
-
     async def _run_async(self):
-        """Main async entry point executed in the thread's event loop."""
+        """Async entry point for the bridge."""
         await self._start_all()
-        try:
-            await self._stream_positions()
-        except asyncio.CancelledError:
-            logger.info("[ODRV] _run_async cancelled")
-        except Exception as e:
-            logger.exception(f"[ODRV] exception in _run_async: {e}")
-        finally:
-            # attempt graceful shutdown of drivers if any
-            if self._drivers:
-                try:
-                    for aid, drv in self._drivers:
-                        if hasattr(drv, "set_axis_state"):
-                            try:
-                                await drv.set_axis_state("IDLE")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-            logger.info("[ODRV] _run_async finished")
+        await self._stream_positions()
 
     def run(self):
-        """Thread run: create a dedicated asyncio loop and run the async entry."""
+        """Thread entry point — runs an asyncio loop."""
         try:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            # run until _run_async completes or loop is stopped
-            self.loop.run_until_complete(self._run_async())
+            asyncio.run(self._run_async())
         except Exception as e:
-            logger.error(f"ODrive asyncio loop error: {e}")
-        finally:
-            try:
-                self.loop.close()
-            except Exception:
-                pass
-            logger.info("[ODRV] Bridge thread exiting")
+            logger.error(f"[ODRV] asyncio loop error: {e}")
+
 
 
 def tcp_command_server(state: RobotState):
