@@ -129,6 +129,7 @@ class RobotState:
         # 6-axis commanded position targets (turns)
         self.axes_pos_cmd = [0.0] * 6
         self.state = "disable"         # enable|disable|estop
+        self.state_version = 0         # bump on every set_state() to notify bridge
         self.profile = []
         self.player_thread = None
         # Per-axis measured feedback (pos_estimate / vel_estimate)
@@ -161,11 +162,16 @@ class RobotState:
             raise ValueError("state must be one of: enable, disable, estop")
         with self.lock:
             self.state = value
-        logger.info(f"State set to: {value}")
+            self.state_version += 1
+        logger.info(f"State set to: {value} (version {self.state_version})")
 
     def get_state(self) -> str:
         with self.lock:
             return self.state
+
+    def get_state_version(self) -> int:
+        with self.lock:
+            return self.state_version
 
     # Feedback setters/getters (per-axis)
     def set_axis_feedback(self, axis_id: int, pos_estimate=None, vel_estimate=None):
@@ -271,6 +277,7 @@ class ODriveCANBridge(threading.Thread):
         self._stop = threading.Event()
         self._drivers = []              # list[(axis_id, drv)]
         self._last_state = None
+        self._applied_state_version = -1
         self._last_log = 0.0
         self._feedback_seen = {aid: 0 for aid in AXIS_NODE_IDS}
 
@@ -430,11 +437,18 @@ class ODriveCANBridge(threading.Thread):
         while not self._stop.is_set():
             now = time.perf_counter()
             st = self.state.get_state()
+            sv = self.state.get_state_version()
 
-            if st != self._last_state:
-                await self._apply_state(st)
-                self._last_state = st
+            # Apply state if changed or not yet applied
+            if sv != self._applied_state_version:
+                try:
+                    await self._apply_state(st)
+                    self._applied_state_version = sv
+                    logger.info(f"[ODRV] Applied state '{st}' (version {sv}) to all axes")
+                except Exception as e:
+                    logger.error(f"[ODRV] Failed applying state '{st}': {e}")
 
+            # Send positions when enabled
             if self._drivers and st == "enable" and (now - last_cmd) >= dt_cmd:
                 positions = self.state.get_axes()
                 for i, (aid, drv) in enumerate(self._drivers):
@@ -444,6 +458,7 @@ class ODriveCANBridge(threading.Thread):
                         logger.error(f"Axis {aid} set_input_pos failed: {e}")
                 last_cmd = now
 
+            # Periodic summary of feedback received
             if (now - last_log) >= dt_log:
                 summary = ", ".join(f"{aid}:{self._feedback_seen.get(aid,0)}"
                                     for aid, _ in self._drivers)
