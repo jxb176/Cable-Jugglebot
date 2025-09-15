@@ -326,8 +326,8 @@ class ODriveCANBridge(threading.Thread):
         for axis_id in AXIS_NODE_IDS:
             try:
                 drv = odc.ODriveCAN(axis_id=axis_id)
-                # attach feedback callback BEFORE start
-                drv.feedback_callback = lambda aid=axis_id, fb=None: self._on_feedback(aid, fb)
+                # feedback callback gets only fb; axis_id captured from loop
+                drv.feedback_callback = lambda fb, aid=axis_id: self._on_feedback(aid, fb)
                 await drv.start()
                 self._drivers.append((axis_id, drv))
                 logger.info(f"[ODRV] axis {axis_id} driver started")
