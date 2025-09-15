@@ -190,6 +190,8 @@ class RobotState:
                     self.axes_vel_estimate[axis_id] = float(vel_estimate)
                 except Exception:
                     pass
+            # --- debug log ---
+            logger.info(f"[DEBUG] axes_pos_estimate: {self.axes_pos_estimate}")
 
     def get_feedback(self):
         """Return (pos_estimate[6], vel_estimate[6]) lists (may contain None)."""
