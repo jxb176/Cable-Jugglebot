@@ -287,57 +287,16 @@ class ODriveCANBridge(threading.Thread):
         logger.info("[TRACE] ODriveCANBridge: start_all completed; drivers=%s",
                     [aid for aid, _ in self._drivers])
 
-    async def _stream_positions(self):
-        dt_cmd = 1.0 / max(1e-3, ODRIVE_COMMAND_RATE_HZ)
-        heartbeat_dt = 0.5
-        last_cmd = time.perf_counter()
-        last_heartbeat = time.perf_counter()
-
-        while not self._stop.is_set():
-            now = time.perf_counter()
-            st = self.state.get_state()
-            sv = self.state.get_state_version()
-
-            # Heartbeat: prove loop is alive and show versions
-            if now - last_heartbeat >= heartbeat_dt:
-                logger.info("[TRACE] loop alive: st='%s' sv=%s applied=%s drivers=%s",
-                            st, sv, self._applied_state_version, [aid for aid, _ in self._drivers])
-                last_heartbeat = now
-
-            # Apply on version change
-            if sv != self._applied_state_version:
-                logger.info("[TRACE] state change detected: st='%s' sv=%s -> apply", st, sv)
-                await self._apply_state(st)
-                self._applied_state_version = sv
-                logger.info("[TRACE] state applied: st='%s' applied=%s", st, self._applied_state_version)
-
-            # Retry enable once per second while enabled (in case an earlier attempt failed silently)
-            if st == "enable" and (now - self._last_enable_retry) >= 1.0:
-                try:
-                    await self._apply_state("enable")
-                    logger.info("[TRACE] periodic enable retry applied")
-                except Exception as e:
-                    logger.error("[TRACE] periodic enable retry failed: %s", e)
-                self._last_enable_retry = now
-
-            # Send setpoints when enabled
-            if self._drivers and st == "enable" and (now - last_cmd) >= dt_cmd:
-                positions = self.state.get_axes()
-                for i, (aid, drv) in enumerate(self._drivers):
-                    try:
-                        drv.set_input_pos(float(positions[i]))
-                    except Exception as e:
-                        logger.error("[ODRV] axis %s set_input_pos failed: %s", aid, e)
-                last_cmd = now
-
-            await asyncio.sleep(0.002)
-
-    def run(self):
+    async def _apply_state(self, st: str):
+        if not self._drivers:
+            logger.warning("[TRACE] _apply_state called but no drivers are started")
+            return
         try:
-            logger.info("[TRACE] ODriveCANBridge: run() starting")
-            asyncio.run(self._run_async())
-        except Exception as e:
-            logger.exception("[TRACE] ODriveCANBridge: run() exception: %s", e)
+            if st == "enable":
+                for idx, (aid, drv) in enumerate(self._drivers):
+                    # Optional: clear/inspect errors before enabling
+                    try:
+                        drv.check_errors()
                     except Exception as e:
                         logger.debug(f"[TRACE] axis {aid}: check_errors raised: {e}")
                     if hasattr(drv, "clear_errors"):
@@ -374,6 +333,7 @@ class ODriveCANBridge(threading.Thread):
                         logger.exception(f"[TRACE] axis {aid}: set_axis_state('IDLE') raised: {e}")
 
             elif st == "estop":
+                # Safe fallback: go to IDLE
                 for aid, drv in self._drivers:
                     logger.info(f"[TRACE] axis {aid}: estop -> set_axis_state('IDLE')")
                     try:
