@@ -311,6 +311,8 @@ class ODriveCANBridge(threading.Thread):
         self._stop = threading.Event()
         self._drivers = []              # list[(axis_id, drv)]
         self._applied_state_version = -1
+        # Initialize feedback counter per axis
+        self._feedback_seen = [0] * 6
 
     def stop(self):
         self._stop.set()
@@ -327,11 +329,14 @@ class ODriveCANBridge(threading.Thread):
             try:
                 drv = odc.ODriveCAN(axis_id=axis_id)
 
-                # Capture axis_id in default argument to avoid lambda late binding
-                def make_callback(aid):
-                    return lambda fb: self._on_feedback(aid, fb)
+                # Capture axis_id correctly and log all feedback
+                def make_feedback_cb(aid):
+                    def cb(fb):
+                        logger.debug(f"[ODRV] feedback callback for axis {aid}: {fb}")
+                        self._on_feedback(aid, fb)
+                    return cb
 
-                drv.feedback_callback = make_callback(axis_id)
+                drv.feedback_callback = make_feedback_cb(axis_id)
 
                 await drv.start()
                 self._drivers.append((axis_id, drv))
@@ -348,8 +353,8 @@ class ODriveCANBridge(threading.Thread):
         """
         Handle feedback from a single axis.
 
-        axis_id: integer 0..5 (captured in lambda)
-        fb: feedback object from odrive_can (usually a dict with keys like 'Pos_Estimate', 'Vel_Estimate')
+        axis_id: integer 0..5
+        fb: feedback object from odrive_can (usually a dict with keys 'Pos_Estimate', 'Vel_Estimate')
         """
         try:
             # Validate axis_id
@@ -357,22 +362,28 @@ class ODriveCANBridge(threading.Thread):
                 logger.warning(f"[ODRV] _on_feedback received invalid axis_id: {axis_id}")
                 return
 
-            # Extract position and velocity safely
-            pos_val = None
-            vel_val = None
-
-            # Feedback is usually a dict
-            if isinstance(fb, dict):
-                pos_val = fb.get("Pos_Estimate")
-                vel_val = fb.get("Vel_Estimate")
-            else:
-                logger.warning(f"[ODRV] _on_feedback received unexpected feedback type: {type(fb)}")
+            # Feedback should be a dict
+            if not isinstance(fb, dict):
+                logger.warning(f"[ODRV] _on_feedback unexpected feedback type: {type(fb)}")
                 return
 
-            # Update RobotState only if we have valid numbers
+            pos_val = fb.get("Pos_Estimate")
+            vel_val = fb.get("Vel_Estimate")
+
+            # Convert to float safely
+            try:
+                pos_val = float(pos_val) if pos_val is not None else None
+            except Exception:
+                pos_val = None
+            try:
+                vel_val = float(vel_val) if vel_val is not None else None
+            except Exception:
+                vel_val = None
+
+            # Store only if at least one value is valid
             if pos_val is not None or vel_val is not None:
                 self.state.set_axis_feedback(axis_id, pos_estimate=pos_val, vel_estimate=vel_val)
-                self._feedback_seen[axis_id] += 1
+                logger.debug(f"[ODRV] stored feedback axis {axis_id}: pos={pos_val}, vel={vel_val}")
 
         except Exception as e:
             logger.exception(f"[ODRV] Exception in _on_feedback for axis {axis_id}: {e}")
