@@ -316,32 +316,85 @@ class ODriveCANBridge(threading.Thread):
         self._stop.set()
 
     async def _start_all(self):
-        """Create and start all ODriveCAN driver instances."""
-        for aid in AXIS_NODE_IDS:
+        """Initialize all ODriveCAN drivers and attach feedback callbacks."""
+        if odc is None:
+            logger.warning("[ODRV] odrive_can module missing; running in simulation mode")
+            return
+
+        self._drivers = []
+
+        for axis_id in AXIS_NODE_IDS:
             try:
-                drv = odc.ODriveCAN(axis_id=aid)
-
-                # Hook up feedback callback
-                drv.feedback_callback = lambda fb, axis=aid: self._on_feedback(axis, fb)
-
-                # Must start the async driver
+                drv = odc.ODriveCAN(axis_id=axis_id)
+                # attach feedback callback BEFORE start
+                drv.feedback_callback = lambda aid=axis_id, fb=None: self._on_feedback(aid, fb)
                 await drv.start()
-
-                self._drivers.append((aid, drv))
-                logger.info(f"[ODRV] axis {aid} driver started")
+                self._drivers.append((axis_id, drv))
+                logger.info(f"[ODRV] axis {axis_id} driver started")
             except Exception as e:
-                logger.warning(f"[ODRV] axis {aid} driver init failed: {e}")
+                logger.warning(f"[ODRV] axis {axis_id} driver init failed: {e}")
+
+        if not self._drivers:
+            logger.warning("[ODRV] No drivers successfully initialized")
+        else:
+            logger.info(f"[ODRV] drivers initialized: {[aid for aid, _ in self._drivers]}")
 
     def _on_feedback(self, axis_id, fb):
-        """Called by driver when feedback arrives."""
-        logger.debug(f"[ODRV] raw feedback axis {axis_id}: {fb!r}")
+        """
+        Converts odrive_can feedback to pos/vel and stores in RobotState.
+        Handles multiple formats: scalar, tuple/list, dict.
+        """
         try:
-            pos = fb.get("pos", None)
-            vel = fb.get("vel", None)
-            self.state.set_axis_feedback(axis_id, pos_estimate=pos, vel_estimate=vel)
-            # Track counts if you like
-        except Exception as e:
-            logger.debug(f"[ODRV] feedback handler error: {e}")
+            pos_val = None
+            vel_val = None
+
+            # dict feedback
+            if isinstance(fb, dict):
+                pos_keys = ("pos", "position", "position_estimate", "position_raw")
+                vel_keys = ("vel", "velocity", "vel_estimate", "velocity_raw")
+                for k in pos_keys:
+                    if k in fb and fb[k] is not None:
+                        pos_val = fb[k]
+                        break
+                for k in vel_keys:
+                    if k in fb and fb[k] is not None:
+                        vel_val = fb[k]
+                        break
+                # flatten lists
+                if isinstance(pos_val, (list, tuple)) and pos_val:
+                    pos_val = pos_val[0]
+                if isinstance(vel_val, (list, tuple)) and vel_val:
+                    vel_val = vel_val[0]
+
+            # tuple/list feedback
+            elif isinstance(fb, (list, tuple)):
+                if len(fb) >= 1:
+                    pos_val = fb[0]
+                if len(fb) >= 2:
+                    vel_val = fb[1]
+
+            # scalar feedback
+            elif isinstance(fb, (int, float)):
+                pos_val = float(fb)
+
+            # convert to float safely
+            try:
+                pos_val = float(pos_val) if pos_val is not None else None
+            except Exception:
+                pos_val = None
+            try:
+                vel_val = float(vel_val) if vel_val is not None else None
+            except Exception:
+                vel_val = None
+
+            # store in RobotState
+            self.state.set_axis_feedback(axis_id, pos_estimate=pos_val, vel_estimate=vel_val)
+
+            # count feedback seen
+            self._feedback_seen[axis_id] = self._feedback_seen.get(axis_id, 0) + 1
+
+        except Exception:
+            logger.exception(f"[ODRV] Exception in _on_feedback for axis {axis_id}")
 
     async def _apply_state(self, st: str):
         """Apply high-level state (enable/disable/estop) to all axes."""
