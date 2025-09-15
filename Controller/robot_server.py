@@ -334,6 +334,7 @@ class ODriveCANBridge(threading.Thread):
 
     def _on_feedback(self, axis_id, fb):
         """Called by driver when feedback arrives."""
+        logger.debug(f"[ODRV] raw feedback axis {axis_id}: {fb!r}")
         try:
             pos = fb.get("pos", None)
             vel = fb.get("vel", None)
