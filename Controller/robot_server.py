@@ -280,30 +280,59 @@ class ODriveCANBridge(threading.Thread):
     def _feedback_cb(self, axis_id: int):
         def _cb(msg, caller):
             print(f"[ODRV] axis={axis_id} feedback: {msg}")
-            # Try to extract pos_estimate / vel_estimate from msg
             pos_val = None
             vel_val = None
             try:
-                # Attribute-style
-                if hasattr(msg, "pos_estimate"):
-                    pos_val = float(getattr(msg, "pos_estimate"))
-                if hasattr(msg, "vel_estimate"):
-                    vel_val = float(getattr(msg, "vel_estimate"))
-                # Dict-style in msg.data
+                # Attribute-style (handle common capitalizations)
+                for attr in ("pos_estimate", "Pos_Estimate", "POS_ESTIMATE"):
+                    if hasattr(msg, attr):
+                        try:
+                            pos_val = float(getattr(msg, attr))
+                            break
+                        except Exception:
+                            pass
+                for attr in ("vel_estimate", "Vel_Estimate", "VEL_ESTIMATE"):
+                    if hasattr(msg, attr):
+                        try:
+                            vel_val = float(getattr(msg, attr))
+                            break
+                        except Exception:
+                            pass
+
+                # Dict-style in msg.data (case-insensitive)
                 data = getattr(msg, "data", None)
                 if isinstance(data, dict):
-                    if pos_val is None and "pos_estimate" in data:
-                        pos_val = float(data["pos_estimate"])
-                    if vel_val is None and "vel_estimate" in data:
-                        vel_val = float(data["vel_estimate"])
+                    low = {str(k).lower(): v for k, v in data.items()}
+                    if pos_val is None:
+                        for k in ("pos_estimate", "position", "pos"):
+                            if k in low:
+                                try:
+                                    pos_val = float(low[k])
+                                    break
+                                except Exception:
+                                    pass
+                    if vel_val is None:
+                        for k in ("vel_estimate", "velocity", "vel"):
+                            if k in low:
+                                try:
+                                    vel_val = float(low[k])
+                                    break
+                                except Exception:
+                                    pass
+
                 # Tuple/list-style [pos, vel]
                 if (pos_val is None or vel_val is None) and isinstance(data, (list, tuple)) and len(data) >= 2:
                     if pos_val is None:
-                        pos_val = float(data[0])
+                        try:
+                            pos_val = float(data[0])
+                        except Exception:
+                            pass
                     if vel_val is None:
-                        vel_val = float(data[1])
+                        try:
+                            vel_val = float(data[1])
+                        except Exception:
+                            pass
             except Exception:
-                # ignore parse errors
                 pass
 
             # Store into RobotState per-axis feedback

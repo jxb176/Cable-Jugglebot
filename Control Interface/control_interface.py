@@ -339,12 +339,19 @@ class RobotGUI(QWidget):
                         self.fb_labels[i][1].setText(f"{v:.4f}")
                     # Cache last arrays
                     if isinstance(pos, list) and len(pos) >= 6:
-                        self.last_pos = [float(x) for x in pos[:6]]
+                        # None-safe conversion to float (None -> NaN)
+                        self.last_pos = [
+                            (float(x) if x is not None else float("nan")) for x in pos[:6]
+                        ]
                     if isinstance(vel, list) and len(vel) >= 6:
-                        self.last_vel = [float(x) for x in vel[:6]]
+                        self.last_vel = [
+                            (float(x) if x is not None else float("nan")) for x in vel[:6]
+                        ]
                     # Plot axis 1 position (if available)
                     self.xdata.append(t - self.start_time)
-                    self.ydata.append(self.last_pos[0] if self.last_pos else 0.0)
+                    # Use 0.0 if NaN
+                    a1 = self.last_pos[0] if self.last_pos and self.last_pos[0] == self.last_pos[0] else 0.0
+                    self.ydata.append(a1)
                     if len(self.xdata) > 200:
                         self.xdata = self.xdata[-200:]
                         self.ydata = self.ydata[-200:]
