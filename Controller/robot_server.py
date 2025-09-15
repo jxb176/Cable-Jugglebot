@@ -281,232 +281,115 @@ class ODriveCANBridge(threading.Thread):
         self._last_log = 0.0
         self._feedback_seen = {aid: 0 for aid in AXIS_NODE_IDS}
 
-    def stop(self):
-        self._stop.set()
-
-    def _feedback_cb(self, axis_id: int):
-        def _cb(msg, caller):
-            #print(f"[ODRV] axis={axis_id} feedback: {msg}")
-            pos_val = None
-            vel_val = None
-            try:
-                # Attribute-style (handle common capitalizations)
-                for attr in ("pos_estimate", "Pos_Estimate", "POS_ESTIMATE"):
-                    if hasattr(msg, attr):
-                        try:
-                            pos_val = float(getattr(msg, attr))
-                            break
-                        except Exception:
-                            pass
-                for attr in ("vel_estimate", "Vel_Estimate", "VEL_ESTIMATE"):
-                    if hasattr(msg, attr):
-                        try:
-                            vel_val = float(getattr(msg, attr))
-                            break
-                        except Exception:
-                            pass
-
-                # Dict-style in msg.data (case-insensitive)
-                data = getattr(msg, "data", None)
-                if isinstance(data, dict):
-                    low = {str(k).lower(): v for k, v in data.items()}
-                    if pos_val is None:
-                        for k in ("pos_estimate", "position", "pos"):
-                            if k in low:
-                                try:
-                                    pos_val = float(low[k])
-                                    break
-                                except Exception:
-                                    pass
-                    if vel_val is None:
-                        for k in ("vel_estimate", "velocity", "vel"):
-                            if k in low:
-                                try:
-                                    vel_val = float(low[k])
-                                    break
-                                except Exception:
-                                    pass
-
-                # Tuple/list-style [pos, vel]
-                if (pos_val is None or vel_val is None) and isinstance(data, (list, tuple)) and len(data) >= 2:
-                    if pos_val is None:
-                        try:
-                            pos_val = float(data[0])
-                        except Exception:
-                            pass
-                    if vel_val is None:
-                        try:
-                            vel_val = float(data[1])
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-            # Store into RobotState per-axis feedback
-            if pos_val is not None or vel_val is not None:
-                self.state.set_axis_feedback(axis_id, pos_estimate=pos_val, vel_estimate=vel_val)
-
-            self._feedback_seen[axis_id] = self._feedback_seen.get(axis_id, 0) + 1
-        return _cb
-
     async def _start_all(self):
-        """Create and start ODriveCAN instances for all node IDs."""
-        if odc is None:
-            logger.warning("odrive_can not available; running in simulation mode (no CAN I/O)")
-            return
-
-        # Try to create a python-can Bus to pass into ODriveCAN
-        can_bus = None
-        try:
-            import can  # python-can
-            # Use 'interface' kw (bustype is deprecated in recent python-can)
-            can_bus = can.interface.Bus(interface="socketcan", channel=ODRIVE_INTERFACE)
-            logger.info(f"[CAN] python-can bus created for {ODRIVE_INTERFACE}")
-        except Exception as e:
-            logger.warning(f"[CAN] Could not create python-can bus for {ODRIVE_INTERFACE}: {e}")
-
+        # ... existing code ...
+        started_axes = []
         for aid in AXIS_NODE_IDS:
             try:
-                drv = None
-                last_err = None
-
-                ctor_attempts = []
-                if can_bus is not None:
-                    # Prefer passing an actual bus object
-                    ctor_attempts.append(("kw axis_id+busObj", lambda: odc.ODriveCAN(axis_id=aid, bus=can_bus)))
-                # Fallbacks that rely on env var CAN_CHANNEL
-                ctor_attempts.extend([
-                    ("kw axis_id only (env CAN_CHANNEL)", lambda: odc.ODriveCAN(axis_id=aid)),
-                ])
-
-                for label, factory in ctor_attempts:
-                    try:
-                        drv = factory()
-                        logger.info(f"ODrive axis {aid}: constructed with '{label}'")
-                        # Sanity check: avoid keeping a driver if its internal bus is a str
-                        if hasattr(drv, "_bus") and isinstance(getattr(drv, "_bus"), str):
-                            raise TypeError("Driver _bus is str; expected bus object")
-                        break
-                    except Exception as e:
-                        last_err = e
-                        drv = None
-                        continue
-
-                if drv is None:
-                    raise RuntimeError(f"ODriveCAN constructor not compatible for axis {aid}: {last_err}")
-
+                # ... existing driver construction ...
                 drv.feedback_callback = self._feedback_cb(aid)
                 await drv.start()
-
-                # Optional: configure controller mode for position control (per example)
+                # Controller/mode setup (existing)
                 drv.check_errors()
                 drv.set_controller_mode("POSITION_CONTROL", "POS_FILTER")
                 drv.set_linear_count(0)
-
                 self._drivers.append((aid, drv))
-                logger.info(f"ODrive axis {aid} started on '{ODRIVE_INTERFACE}'")
+                started_axes.append(aid)
+                logger.info(f"[ODRV] axis {aid} started on '{ODRIVE_INTERFACE}'")
             except Exception as e:
-                logger.error(f"Failed to init ODrive axis {aid}: {e}")
+                logger.error(f"[ODRV] init axis {aid} failed: {e}")
+        logger.info(f"[TRACE] ODriveCANBridge started drivers: {started_axes}")
 
     async def _apply_state(self, st: str):
         if not self._drivers:
+            logger.warning("[TRACE] _apply_state called but no drivers are started")
             return
         try:
             if st == "enable":
                 for idx, (aid, drv) in enumerate(self._drivers):
-                    # TRACE: before attempting to enable
-                    logger.info(f"[TRACE] enabling axis {aid}: calling set_axis_state('CLOSED_LOOP_CONTROL')")
+                    # Optional clear errors
+                    try:
+                        drv.check_errors()
+                    except Exception as e:
+                        logger.debug(f"[TRACE] axis {aid}: check_errors raised: {e}")
+                    if hasattr(drv, "clear_errors"):
+                        try:
+                            drv.clear_errors()
+                        except Exception:
+                            pass
+
+                    # TRACE: prove we reached the call
+                    logger.info(f"[TRACE] axis {aid}: calling set_axis_state('CLOSED_LOOP_CONTROL')")
                     try:
                         await drv.set_axis_state("CLOSED_LOOP_CONTROL")
-                        logger.info(f"[TRACE] enabling axis {aid}: set_axis_state returned OK")
+                        logger.info(f"[TRACE] axis {aid}: set_axis_state returned OK")
                     except Exception as e:
-                        logger.exception(f"[TRACE] enabling axis {aid}: set_axis_state raised: {e}")
+                        logger.exception(f"[TRACE] axis {aid}: set_axis_state raised: {e}")
                         continue
 
-                    # Optionally send an initial setpoint to confirm control loop is active
+                    # Kick with initial setpoint
                     try:
                         cmd = self.state.get_axes()
-                        init_setp = float(cmd[idx]) if idx < len(cmd) else 0.0
-                        drv.set_input_pos(init_setp)
-                        logger.info(f"[TRACE] enabling axis {aid}: initial set_input_pos({init_setp}) sent")
+                        setp = float(cmd[idx]) if idx < len(cmd) else 0.0
+                        drv.set_input_pos(setp)
+                        logger.info(f"[TRACE] axis {aid}: initial set_input_pos({setp})")
                     except Exception as e:
-                        logger.warning(f"[TRACE] enabling axis {aid}: initial set_input_pos failed: {e}")
-
-                    # If available, verify current state
-                    if hasattr(drv, "get_axis_state"):
-                        try:
-                            cur = await drv.get_axis_state()
-                            logger.info(f"[TRACE] enabling axis {aid}: get_axis_state() -> {cur}")
-                        except Exception as e:
-                            logger.debug(f"[TRACE] enabling axis {aid}: get_axis_state failed: {e}")
+                        logger.debug(f"[TRACE] axis {aid}: initial set_input_pos failed: {e}")
 
             elif st == "disable":
                 for aid, drv in self._drivers:
-                    logger.info(f"[TRACE] disabling axis {aid}: calling set_axis_state('IDLE')")
+                    logger.info(f"[TRACE] axis {aid}: calling set_axis_state('IDLE')")
                     try:
                         await drv.set_axis_state("IDLE")
-                        logger.info(f"[TRACE] disabling axis {aid}: set_axis_state returned OK")
+                        logger.info(f"[TRACE] axis {aid}: set_axis_state('IDLE') OK")
                     except Exception as e:
-                        logger.exception(f"[TRACE] disabling axis {aid}: set_axis_state raised: {e}")
+                        logger.exception(f"[TRACE] axis {aid}: set_axis_state('IDLE') raised: {e}")
 
             elif st == "estop":
                 for aid, drv in self._drivers:
-                    logger.info(f"[TRACE] estop axis {aid}: calling set_axis_state('IDLE')")
+                    logger.info(f"[TRACE] axis {aid}: estop -> set_axis_state('IDLE')")
                     try:
                         await drv.set_axis_state("IDLE")
-                        logger.info(f"[TRACE] estop axis {aid}: set_axis_state returned OK")
+                        logger.info(f"[TRACE] axis {aid}: estop->IDLE OK")
                     except Exception as e:
-                        logger.exception(f"[TRACE] estop axis {aid}: set_axis_state raised: {e}")
+                        logger.exception(f"[TRACE] axis {aid}: estop->IDLE raised: {e}")
+
         except Exception as e:
-            logger.error(f"Failed applying state '{st}' to ODrive: {e}")
+            logger.error(f"[ODRV] _apply_state('{st}') failed: {e}")
 
     async def _stream_positions(self):
         dt_cmd = 1.0 / max(1e-3, ODRIVE_COMMAND_RATE_HZ)
         dt_log = 1.0 / max(1e-3, ODRIVE_LOG_RATE_HZ)
-        t0 = time.perf_counter()
-        last_cmd = t0
-        last_log = t0
+        last_cmd = time.perf_counter()
+        last_log = time.perf_counter()
 
         while not self._stop.is_set():
             now = time.perf_counter()
             st = self.state.get_state()
             sv = self.state.get_state_version()
 
-            # Apply state if changed or not yet applied
+            # TRACE: show decision to apply
             if sv != self._applied_state_version:
-                try:
-                    await self._apply_state(st)
-                    self._applied_state_version = sv
-                    logger.info(f"[ODRV] Applied state '{st}' (version {sv}) to all axes")
-                except Exception as e:
-                    logger.error(f"[ODRV] Failed applying state '{st}': {e}")
+                logger.info(f"[TRACE] state change detected: st='{st}', sv={sv}, applied={self._applied_state_version}")
+                await self._apply_state(st)
+                self._applied_state_version = sv
+                logger.info(f"[TRACE] state applied: st='{st}', applied={self._applied_state_version}")
 
-            # Send positions when enabled
             if self._drivers and st == "enable" and (now - last_cmd) >= dt_cmd:
                 positions = self.state.get_axes()
                 for i, (aid, drv) in enumerate(self._drivers):
                     try:
                         drv.set_input_pos(float(positions[i]))
                     except Exception as e:
-                        logger.error(f"Axis {aid} set_input_pos failed: {e}")
+                        logger.error(f"[ODRV] axis {aid} set_input_pos failed: {e}")
                 last_cmd = now
 
-            # Periodic summary of feedback received
             if (now - last_log) >= dt_log:
-                summary = ", ".join(f"{aid}:{self._feedback_seen.get(aid,0)}"
-                                    for aid, _ in self._drivers)
+                summary = ", ".join(f"{aid}:{self._feedback_seen.get(aid,0)}" for aid, _ in self._drivers)
                 logger.info(f"[ODRV] feedback counts: {summary if summary else 'no drivers'}")
                 last_log = now
 
             await asyncio.sleep(0.002)
-
-    async def _run_async(self):
-        await self._start_all()
-        await self._apply_state(self.state.get_state())
-        await self._stream_positions()
-
-    def run(self):
-        if odc is None:
             logger.warning("ODrive bridge running in simulation mode (odrive_can missing)")
             while not self._stop.is_set():
                 time.sleep(0.5)
