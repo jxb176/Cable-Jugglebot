@@ -286,7 +286,7 @@ class ODriveCANBridge(threading.Thread):
 
     def _feedback_cb(self, axis_id: int):
         def _cb(msg, caller):
-            print(f"[ODRV] axis={axis_id} feedback: {msg}")
+            #print(f"[ODRV] axis={axis_id} feedback: {msg}")
             pos_val = None
             vel_val = None
             try:
