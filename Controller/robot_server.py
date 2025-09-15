@@ -280,36 +280,64 @@ class ODriveCANBridge(threading.Thread):
         self._applied_state_version = -1
         self._last_log = 0.0
         self._feedback_seen = {aid: 0 for aid in AXIS_NODE_IDS}
+        self._last_enable_retry = 0.0  # retry timer
 
     async def _start_all(self):
-        # ... existing code ...
-        started_axes = []
-        for aid in AXIS_NODE_IDS:
-            try:
-                # ... existing driver construction ...
-                drv.feedback_callback = self._feedback_cb(aid)
-                await drv.start()
-                # Controller/mode setup (existing)
-                drv.check_errors()
-                drv.set_controller_mode("POSITION_CONTROL", "POS_FILTER")
-                drv.set_linear_count(0)
-                self._drivers.append((aid, drv))
-                started_axes.append(aid)
-                logger.info(f"[ODRV] axis {aid} started on '{ODRIVE_INTERFACE}'")
-            except Exception as e:
-                logger.error(f"[ODRV] init axis {aid} failed: {e}")
-        logger.info(f"[TRACE] ODriveCANBridge started drivers: {started_axes}")
+        # ... existing driver init ...
+        logger.info("[TRACE] ODriveCANBridge: start_all completed; drivers=%s",
+                    [aid for aid, _ in self._drivers])
 
-    async def _apply_state(self, st: str):
-        if not self._drivers:
-            logger.warning("[TRACE] _apply_state called but no drivers are started")
-            return
-        try:
-            if st == "enable":
-                for idx, (aid, drv) in enumerate(self._drivers):
-                    # Optional clear errors
+    async def _stream_positions(self):
+        dt_cmd = 1.0 / max(1e-3, ODRIVE_COMMAND_RATE_HZ)
+        heartbeat_dt = 0.5
+        last_cmd = time.perf_counter()
+        last_heartbeat = time.perf_counter()
+
+        while not self._stop.is_set():
+            now = time.perf_counter()
+            st = self.state.get_state()
+            sv = self.state.get_state_version()
+
+            # Heartbeat: prove loop is alive and show versions
+            if now - last_heartbeat >= heartbeat_dt:
+                logger.info("[TRACE] loop alive: st='%s' sv=%s applied=%s drivers=%s",
+                            st, sv, self._applied_state_version, [aid for aid, _ in self._drivers])
+                last_heartbeat = now
+
+            # Apply on version change
+            if sv != self._applied_state_version:
+                logger.info("[TRACE] state change detected: st='%s' sv=%s -> apply", st, sv)
+                await self._apply_state(st)
+                self._applied_state_version = sv
+                logger.info("[TRACE] state applied: st='%s' applied=%s", st, self._applied_state_version)
+
+            # Retry enable once per second while enabled (in case an earlier attempt failed silently)
+            if st == "enable" and (now - self._last_enable_retry) >= 1.0:
+                try:
+                    await self._apply_state("enable")
+                    logger.info("[TRACE] periodic enable retry applied")
+                except Exception as e:
+                    logger.error("[TRACE] periodic enable retry failed: %s", e)
+                self._last_enable_retry = now
+
+            # Send setpoints when enabled
+            if self._drivers and st == "enable" and (now - last_cmd) >= dt_cmd:
+                positions = self.state.get_axes()
+                for i, (aid, drv) in enumerate(self._drivers):
                     try:
-                        drv.check_errors()
+                        drv.set_input_pos(float(positions[i]))
+                    except Exception as e:
+                        logger.error("[ODRV] axis %s set_input_pos failed: %s", aid, e)
+                last_cmd = now
+
+            await asyncio.sleep(0.002)
+
+    def run(self):
+        try:
+            logger.info("[TRACE] ODriveCANBridge: run() starting")
+            asyncio.run(self._run_async())
+        except Exception as e:
+            logger.exception("[TRACE] ODriveCANBridge: run() exception: %s", e)
                     except Exception as e:
                         logger.debug(f"[TRACE] axis {aid}: check_errors raised: {e}")
                     if hasattr(drv, "clear_errors"):
