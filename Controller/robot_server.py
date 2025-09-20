@@ -508,10 +508,19 @@ def axes_state_logger(state: RobotState):
         try:
             pos = state.get_pos_fbk()
             vel = state.get_vel_fbk()
+            bus = state.get_bus_voltage()
             st = state.get_state()
+
             fmt_pos = ", ".join("---" if x is None else f"{x:.3f}" for x in pos)
             fmt_vel = ", ".join("---" if v is None else f"{v:.3f}" for v in vel)
-            logger.info(f"[LOG] State={st} Pos=[{fmt_pos}] Vel=[{fmt_vel}]")
+            fmt_bus = ", ".join("---" if b is None else f"{b:.2f}" for b in bus)
+
+            logger.info(
+                f"[LOG] State={st} "
+                f"Pos=[{fmt_pos}] "
+                f"Vel=[{fmt_vel}] "
+                f"BusV=[{fmt_bus}]"
+            )
         except Exception as e:
             logger.error(f"[LOG] Error: {e}")
         time.sleep(1.0)
