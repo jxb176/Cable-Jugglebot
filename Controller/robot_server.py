@@ -226,9 +226,16 @@ class ODriveCANBridge(threading.Thread):
                     return cb
 
                 drv.feedback_callback = make_feedback_cb(axis_id)
-                await drv.start()
-                self._drivers.append((axis_id, drv))
-                logger.info(f"[ODRV] axis {axis_id} driver started")
+                try:
+                    logger.info(f"[ODRV] axis {axis_id}: starting driver")
+                    await asyncio.wait_for(drv.start(), timeout=1.0)
+                    self._drivers.append((axis_id, drv))
+                    logger.info(f"[ODRV] axis {axis_id}: driver started")
+                except asyncio.TimeoutError:
+                    logger.warning(f"[ODRV] axis {axis_id}: drv.start() timed out")
+                except Exception as e:
+                    logger.warning(f"[ODRV] axis {axis_id} driver init failed: {e}")
+
             except Exception as e:
                 logger.warning(f"[ODRV] axis {axis_id} driver init failed: {e}")
 
