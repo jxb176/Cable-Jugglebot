@@ -190,6 +190,28 @@ class RobotState:
             self.profile = prof
         logger.info(f"Profile uploaded: {len(prof)} points, duration {prof[-1][0] - prof[0][0]:.3f}s")
 
+    def start_profile(self, rate_hz: float):
+        """Start executing the uploaded profile at a given rate (Hz)."""
+        self.stop_profile()
+        prof = self.get_profile()
+        if not prof:
+            raise RuntimeError("no profile uploaded")
+        player = ProfilePlayer(self, prof, rate_hz)
+        with self.lock:
+            self.player_thread = player
+        logger.info(f"Profile start at {rate_hz:.1f} Hz")
+        player.start()
+
+    def stop_profile(self):
+        """Stop any running profile playback."""
+        with self.lock:
+            player = self.player_thread
+            self.player_thread = None
+        if player and player.is_alive():
+            player.stop()
+            player.join(timeout=1.0)
+            logger.info("Profile stopped")
+
     # --- Telemetry lifecycle ---
     def start_telem(self, udp_sock, controller_addr):
         self.stop_telem()
@@ -209,6 +231,69 @@ class RobotState:
             self.telem_thread.join(timeout=1.0)
             logger.info("[UDP] Telemetry thread stopped")
         self.telem_thread = None
+
+class ProfilePlayer(threading.Thread):
+    """Plays a time-position profile with linear interpolation at fixed rate."""
+
+    def __init__(self, state: RobotState, profile: list[tuple[float, list[float]]], rate_hz: float):
+        super().__init__(daemon=True)
+        self.state = state
+        self._stop = threading.Event()
+        if rate_hz <= 0:
+            raise ValueError("rate_hz must be > 0")
+        self.dt = 1.0 / rate_hz
+
+        # Normalize profile times so playback starts at t=0
+        if not profile:
+            raise ValueError("empty profile")
+        t0 = float(profile[0][0])
+        norm = []
+        for t, axes in profile:
+            norm.append((float(t) - t0, [float(x) for x in axes]))
+        self.norm_profile = norm
+        self.duration = norm[-1][0] if norm else 0.0
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        if self.duration <= 0.0:
+            # immediate set and exit
+            self.state.set_axes(self.norm_profile[-1][1])
+            logger.info("[PROFILE] Zero-duration profile applied")
+            return
+
+        logger.info(f"[PROFILE] Starting playback at {1.0/self.dt:.1f} Hz, duration {self.duration:.3f}s")
+        start = time.perf_counter()
+        k = 0
+        while not self._stop.is_set():
+            t = time.perf_counter() - start
+            if t >= self.duration:
+                self.state.set_axes(self.norm_profile[-1][1])
+                logger.info("[PROFILE] Completed")
+                break
+
+            # advance segment index
+            while k + 1 < len(self.norm_profile) and self.norm_profile[k + 1][0] <= t:
+                k += 1
+
+            t0, p0 = self.norm_profile[k]
+            t1, p1 = self.norm_profile[min(k + 1, len(self.norm_profile) - 1)]
+            if t1 <= t0:
+                alpha = 0.0
+            else:
+                alpha = max(0.0, min(1.0, (t - t0) / (t1 - t0)))
+            axes = [p0[i] + alpha * (p1[i] - p0[i]) for i in range(6)]
+            try:
+                self.state.set_axes(axes)
+            except Exception as e:
+                logger.error(f"[PROFILE] set_axes error: {e}")
+            time.sleep(self.dt)
+
+        # cleanup: clear player_thread reference if still pointing to us
+        with self.state.lock:
+            if self.state.player_thread is self:
+                self.state.player_thread = None
 
 
 class ODriveCANBridge(threading.Thread):
