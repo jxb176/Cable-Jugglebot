@@ -153,9 +153,17 @@ class RobotState:
             self.axes_pos_cmd = [float(x) for x in positions]
         logger.info("Axes target set: " + ", ".join(f"{x:.4f}" for x in self.axes_pos_cmd))
 
-    def get_axes(self):
+    def get_pos_cmd(self):
         with self.lock:
             return list(self.axes_pos_cmd)
+
+    def get_pos_fbk(self):
+        with self.lock:
+            return list(self.axes_pos_estimate)
+
+    def get_vel_fbk(self):
+        with self.lock:
+            return list(self.axes_vel_estimate)
 
     def set_state(self, value: str):
         value = str(value).lower()
@@ -537,7 +545,7 @@ def udp_telemetry_sender(state: RobotState):
 def axes_state_logger(state: RobotState):
     while True:
         try:
-            axes = state.get_axes()
+            axes = state.get_pos_fbk()
             st = state.get_state()
             logger.info(f"[LOG] State={st} Axes(turns)=[" +
                         ", ".join(f"{x:.3f}" for x in axes) + "]")
