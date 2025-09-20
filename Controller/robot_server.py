@@ -392,10 +392,13 @@ class ODriveCANBridge(threading.Thread):
 
             #logger.debug(f"[ODRV] axis {axis_id} decoded pos={pos_val}, vel={vel_val}")
 
-            if pos_val is not None or vel_val is not None:
-                self.state.set_axis_feedback(axis_id, pos_estimate=pos_val, vel_estimate=vel_val)
-            if bus_v is not None:
-                self.state.set_bus_voltage(bus_v)
+            if (pos_val is not None) or (vel_val is not None) or (bus_v is not None):
+                self.state.set_axis_feedback(
+                    axis_id,
+                    pos_estimate = pos_val,
+                    vel_estimate = vel_val,
+                    bus_voltage = bus_v,
+                )
 
         except Exception as e:
             logger.exception(f"[ODRV] Exception in _on_feedback for axis {axis_id}: {e}")

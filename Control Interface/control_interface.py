@@ -219,12 +219,26 @@ class RobotGUI(QWidget):
         self.curve_vel = self.plot_vel.plot(pen='c')
         layout.addWidget(self.plot_vel)
 
+        # Bus Voltage label + plot
+        self.busv_label = QLabel("Bus Voltage (A1): -- V")
+        layout.addWidget(self.busv_label)
+
+        self.busv_plot = pg.PlotWidget(title="Bus Voltage (V)")
+        self.busv_plot.setLabel('bottom', 'Time', 's')
+        self.busv_plot.setLabel('left', 'Voltage', 'V')
+        self.busv_plot.showGrid(x=True, y=True)
+        self.busv_curve = self.busv_plot.plot(pen='c')
+        layout.addWidget(self.busv_plot)
+
         self.setLayout(layout)
 
         # Data buffers
         self.xdata = []
         self.ydata = []       # position data
         self.ydata_vel = []   # velocity data
+        self.vbus_x = []  # bus voltage time axis
+        self.vbus_y = []  # bus voltage values
+
         self.start_time = time.time()
         self.last_pos = [0.0]*6
         self.last_vel = [0.0]*6
