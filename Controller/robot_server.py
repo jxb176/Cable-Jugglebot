@@ -489,7 +489,7 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
                 controller_addr = (controller_ip, UDP_TELEM_PORT)
                 fb_pos = state.get_pos_fbk()
                 fb_vel = state.get_vel_fbk()
-                bus_v = state.get_bus_voltage()
+                bus_v = state.get_bus_voltage() or []
                 msg = {
                     "t": time.time(),
                     "pos": [None if v is None else float(v) for v in fb_pos],
