@@ -329,7 +329,9 @@ class ODriveCANBridge(threading.Thread):
 
     async def _run_async(self):
         """Async entry point for the bridge."""
+        logger.info("[ODRV] _run_async starting _start_all")
         await self._start_all()
+        logger.info("[ODRV] _run_async finished _start_all, entering _stream_positions")
         await self._stream_positions()
 
     def run(self):
