@@ -520,38 +520,36 @@ def tcp_command_server(state: RobotState):
             logger.info("[TCP] Controller disconnected")
 
 
-def udp_telemetry_sender(state: RobotState):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def udp_telemetry_sender(state: RobotState, udp_sock, controller_addr):
     while True:
-        time.sleep(0.1)
-        ctrl_ip = state.get_controller_ip()
-        if not ctrl_ip:
-            continue
-        # Transmit measured position feedback (axes_pos_estimate) instead of fake value
-        fb_pos, _fb_vel = state.get_feedback()
-        # fb_pos may contain None entries if not yet populated
-        if not isinstance(fb_pos, list) or len(fb_pos) != 6:
-            continue  # wait until we have a full array
-        msg = {
-            "t": time.time(),
-            "pos": [None if v is None else float(v) for v in fb_pos],
-        }
         try:
-            sock.sendto(json.dumps(msg).encode("utf-8"), (ctrl_ip, UDP_TELEM_PORT))
+            fb_pos = state.get_pos_fbk()
+            fb_vel = state.get_vel_fbk()
+            msg = {
+                "t": time.time(),
+                "pos": [None if v is None else float(v) for v in fb_pos],
+                "vel": [None if v is None else float(v) for v in fb_vel],
+            }
+            udp_sock.sendto(json.dumps(msg).encode("utf-8"), controller_addr)
         except Exception as e:
-            logger.error(f"[UDP] Telemetry send error: {e}")
+            logger.error(f"[UDP] Error sending telemetry: {e}")
+        time.sleep(1.0 / TELEMETRY_RATE_HZ)
+
 
 
 def axes_state_logger(state: RobotState):
     while True:
         try:
-            axes = state.get_pos_fbk()
+            pos = state.get_pos_fbk()
+            vel = state.get_vel_fbk()
             st = state.get_state()
-            logger.info(f"[LOG] State={st} Axes(turns)=[" +
-                        ", ".join(f"{x:.3f}" for x in axes) + "]")
+            fmt_pos = ", ".join("---" if x is None else f"{x:.3f}" for x in pos)
+            fmt_vel = ", ".join("---" if v is None else f"{v:.3f}" for v in vel)
+            logger.info(f"[LOG] State={st} Pos=[{fmt_pos}] Vel=[{fmt_vel}]")
         except Exception as e:
             logger.error(f"[LOG] Error reading state/axes: {e}")
         time.sleep(1.0)
+
 
 
 if __name__ == "__main__":
