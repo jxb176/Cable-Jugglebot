@@ -21,8 +21,8 @@ import pyqtgraph as pg
 ROBOT_HOST = "jugglepi.local"  # <-- set to your Raspberry Pi IP or hostname
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
-+# Telemetry connection timeout (seconds)
-+TELEMETRY_TIMEOUT = 2.0
+# Telemetry connection timeout (seconds)
+TELEMETRY_TIMEOUT = 2.0
 
 def _queue_put_latest(q: Queue, item):
     """Keep only the newest item in the queue."""
@@ -222,7 +222,8 @@ class RobotGUI(QWidget):
         self.start_time = time.time()
         self.last_pos = [0.0]*6
         self.last_vel = [0.0]*6
-        self.last_telem_time = 0.0
+        self.last_telem_time = 0  # timestamp of last received telemetry
+        self.telem_timeout = 2.0  # seconds
 
         # Initialize profile dropdown (Profiles subfolder)
         self.populate_profile_dropdown()
@@ -236,6 +237,14 @@ class RobotGUI(QWidget):
         self.conn_timer = QTimer()
         self.conn_timer.timeout.connect(self.check_connection_status)
         self.conn_timer.start(500)  # check every 0.5s
+
+    def check_connection_status(self):
+        """Update connection status label based on last telemetry time."""
+        now = time.time()
+        if self.last_telem_time == 0 or (now - self.last_telem_time) > self.telem_timeout:
+            self.status_label.setText("⚠️ Waiting for telemetry…")
+        else:
+            self.status_label.setText("✅ Connected (telemetry streaming)")
 
     def _profiles_dir(self) -> str:
         """Return absolute path to the Profiles subfolder, creating it if missing."""
