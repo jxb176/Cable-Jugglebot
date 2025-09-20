@@ -336,6 +336,7 @@ class ODriveCANBridge(threading.Thread):
 
     def run(self):
         """Thread entry point — runs an asyncio loop."""
+        logger.info("[ODRV] ODriveCANBridge thread started, entering asyncio.run")
         try:
             asyncio.run(self._run_async())
         except Exception as e:
