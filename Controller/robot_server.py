@@ -36,7 +36,7 @@ def _init_logging():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(logs_dir, f"robot_{ts}.log")
     logger = logging.getLogger("robot")
-    logger.setLevel(logging.INFO)   #Set to DEBUG for more verbose logging
+    logger.setLevel(logging.DEBUG)   #INFO for low level, Set to DEBUG for more verbose logging
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
