@@ -190,6 +190,11 @@ class RobotState:
             self.profile = prof
         logger.info(f"Profile uploaded: {len(prof)} points, duration {prof[-1][0] - prof[0][0]:.3f}s")
 
+    def get_profile(self):
+        """Return the currently stored profile as a list of (t, axes)."""
+        with self.lock:
+            return list(self.profile)
+
     def start_profile(self, rate_hz: float):
         """Start executing the uploaded profile at a given rate (Hz)."""
         self.stop_profile()
