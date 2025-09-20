@@ -1,5 +1,6 @@
 import sys
 import threading
+import math
 import time
 import random
 from queue import Queue
@@ -16,12 +17,12 @@ from PyQt6.QtCore import Qt, QTimer
 
 import pyqtgraph as pg
 
-
 # Networking configuration
 ROBOT_HOST = "jugglepi.local"  # <-- set to your Raspberry Pi IP or hostname
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
-
++# Telemetry connection timeout (seconds)
++TELEMETRY_TIMEOUT = 2.0
 
 def _queue_put_latest(q: Queue, item):
     """Keep only the newest item in the queue."""
@@ -221,6 +222,7 @@ class RobotGUI(QWidget):
         self.start_time = time.time()
         self.last_pos = [0.0]*6
         self.last_vel = [0.0]*6
+        self.last_telem_time = 0.0
 
         # Initialize profile dropdown (Profiles subfolder)
         self.populate_profile_dropdown()
@@ -229,6 +231,11 @@ class RobotGUI(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_gui)
         self.timer.start(100)  # update every 100 ms
+
+        # Timer to check telemetry connection status
+        self.conn_timer = QTimer()
+        self.conn_timer.timeout.connect(self.check_connection_status)
+        self.conn_timer.start(500)  # check every 0.5s
 
     def _profiles_dir(self) -> str:
         """Return absolute path to the Profiles subfolder, creating it if missing."""
@@ -317,46 +324,41 @@ class RobotGUI(QWidget):
         """Check telemetry and update GUI."""
         while not self.telem_queue.empty():
             telem = self.telem_queue.get()
+            self.last_telem_time = time.time()
 
-            # New formats: dicts
+            # --- Dict telemetry (new format) ---
             if isinstance(telem, dict):
                 t = float(telem.get("t", time.time()))
+
                 # Array format: {"pos":[...], "vel":[...]}
                 if "pos" in telem or "vel" in telem:
                     pos = telem.get("pos", self.last_pos)
                     vel = telem.get("vel", self.last_vel)
-                    # Update labels safely
+
+                    # Update feedback labels (None -> '---')
                     for i in range(6):
-                        try:
-                            p = float(pos[i]) if i < len(pos) else float("nan")
-                        except Exception:
-                            p = float("nan")
-                        try:
-                            v = float(vel[i]) if i < len(vel) else float("nan")
-                        except Exception:
-                            v = float("nan")
-                        self.fb_labels[i][0].setText(f"{p:.4f}")
-                        self.fb_labels[i][1].setText(f"{v:.4f}")
-                    # Cache last arrays
+                        p = pos[i] if (isinstance(pos, list) and i < len(pos)) else None
+                        v = vel[i] if (isinstance(vel, list) and i < len(vel)) else None
+                        p_text = "---" if p is None else f"{float(p):.4f}"
+                        v_text = "---" if v is None else f"{float(v):.4f}"
+                        self.fb_labels[i][0].setText(p_text)
+                        self.fb_labels[i][1].setText(v_text)
+
+                    # Cache last arrays (None -> NaN)
                     if isinstance(pos, list) and len(pos) >= 6:
-                        # None-safe conversion to float (None -> NaN)
-                        self.last_pos = [
-                            (float(x) if x is not None else float("nan")) for x in pos[:6]
-                        ]
+                        self.last_pos = [(float(x) if x is not None else float("nan")) for x in pos[:6]]
                     if isinstance(vel, list) and len(vel) >= 6:
-                        self.last_vel = [
-                            (float(x) if x is not None else float("nan")) for x in vel[:6]
-                        ]
-                    # Plot axis 1 position (if available)
+                        self.last_vel = [(float(x) if x is not None else float("nan")) for x in vel[:6]]
+
+                    # Plot axis 1 pos
                     self.xdata.append(t - self.start_time)
-                    # Use 0.0 if NaN
                     a1 = self.last_pos[0] if self.last_pos and self.last_pos[0] == self.last_pos[0] else 0.0
                     self.ydata.append(a1)
                     if len(self.xdata) > 200:
                         self.xdata = self.xdata[-200:]
                         self.ydata = self.ydata[-200:]
-                    self.status_label.setText("Telemetry: arrays (pos/vel) received")
-                # Legacy dict with single value: {"val": <float>}
+
+                # Legacy single value dict: {"val": <float>}
                 elif "val" in telem:
                     val = float(telem["val"])
                     self.xdata.append(t - self.start_time)
@@ -364,24 +366,21 @@ class RobotGUI(QWidget):
                     if len(self.xdata) > 200:
                         self.xdata = self.xdata[-200:]
                         self.ydata = self.ydata[-200:]
-                    self.status_label.setText(f"Telemetry: value={val:.2f}")
 
-            # Legacy tuple format: (t, val)
+            # --- Legacy tuple format: (t, val) ---
             elif isinstance(telem, (tuple, list)) and len(telem) >= 2:
                 try:
                     t = float(telem[0])
                     val = float(telem[1])
                 except Exception:
-                    # Skip malformed tuple
                     continue
                 self.xdata.append(t - self.start_time)
                 self.ydata.append(val)
                 if len(self.xdata) > 200:
                     self.xdata = self.xdata[-200:]
                     self.ydata = self.ydata[-200:]
-                self.status_label.setText(f"Telemetry: value={val:.2f}")
 
-        # Update plot
+        # --- Update plot ---
         self.curve.setData(self.xdata, self.ydata)
 
 
