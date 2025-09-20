@@ -565,7 +565,11 @@ if __name__ == "__main__":
     odrv_bridge.start()
 
     threading.Thread(target=tcp_command_server, args=(state,), daemon=True).start()
-    threading.Thread(target=udp_telemetry_sender, args=(state,), daemon=True).start()
+    threading.Thread(
+        target=udp_telemetry_sender,
+        args=(state, udp_sock, controller_addr),
+        daemon=True
+    ).start()
     threading.Thread(target=axes_state_logger, args=(state,), daemon=True).start()
     logger.info("Robot server running. Press Ctrl+C to exit.")
     try:
