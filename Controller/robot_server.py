@@ -118,6 +118,10 @@ class RobotState:
             self.controller_ip = ip
         logger.info(f"Controller IP set to {ip}")
 
+    def get_controller_ip(self):
+        with self.lock:
+            return self.controller_ip
+
     def get_pos_cmd(self):
         with self.lock:
             return list(self.axes_pos_cmd)
