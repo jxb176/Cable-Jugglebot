@@ -208,7 +208,7 @@ class ODriveCANBridge(threading.Thread):
         self._drivers = []
         for axis_id in AXIS_NODE_IDS:
             try:
-                drv = odc.ODriveCAN(axis_id=axis_id)
+                drv = odc.ODriveCAN(axis_id=axis_id, interface=ODRIVE_INTERFACE)
 
                 def make_cb(aid):
                     def cb(fb):
@@ -217,6 +217,18 @@ class ODriveCANBridge(threading.Thread):
 
                 drv.feedback_callback = make_cb(axis_id)
                 await drv.start()
+
+                drv.check_errors()
+
+                # Optional: configure controller mode
+                drv.set_controller_mode("POSITION_CONTROL", "POS_FILTER")
+
+                # Reset encoder count
+                drv.set_linear_count(0)
+
+                # Put into closed-loop so it streams feedback
+                await drv.set_axis_state("IDLE")
+
                 self._drivers.append((axis_id, drv))
                 logger.info(f"[ODRV] axis {axis_id} started")
             except Exception as e:
