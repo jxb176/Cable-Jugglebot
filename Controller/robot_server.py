@@ -221,7 +221,7 @@ class ODriveCANBridge(threading.Thread):
                 # Proper callback signature: (msg: CanMsg, caller: ODriveCAN)
                 def make_feedback_cb(aid):
                     def cb(msg, caller=None):
-                        logger.debug(f"[ODRV] raw feedback axis {aid}: {msg}")
+                        #logger.debug(f"[ODRV] raw feedback axis {aid}: {msg}")
                         self._on_feedback(aid, msg)
                     return cb
 
@@ -259,7 +259,7 @@ class ODriveCANBridge(threading.Thread):
             if vel_val is None and hasattr(msg, "signals"):
                 vel_val = msg.signals.get("Vel_Estimate")
 
-            logger.debug(f"[ODRV] axis {axis_id} decoded pos={pos_val}, vel={vel_val}")
+            #logger.debug(f"[ODRV] axis {axis_id} decoded pos={pos_val}, vel={vel_val}")
 
             if pos_val is not None or vel_val is not None:
                 self.state.set_axis_feedback(axis_id, pos_estimate=pos_val, vel_estimate=vel_val)
