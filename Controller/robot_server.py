@@ -99,6 +99,7 @@ def ensure_can_interface_up(ifname: str, bitrate: int) -> bool:
         return False
 
 
+
 class RobotState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -110,6 +111,7 @@ class RobotState:
         self.player_thread = None
         self.axes_pos_estimate = [None] * 6
         self.axes_vel_estimate = [None] * 6
+        self.axes_bus_voltage = [None] * 6
         self.telem_thread = None
         self.telem_stop = threading.Event()
 
@@ -134,6 +136,32 @@ class RobotState:
         with self.lock:
             return list(self.axes_vel_estimate)
 
+    def set_axis_feedback(self, axis_id: int, pos_estimate=None, vel_estimate=None, bus_voltage=None):
+        """Store measured feedback for a single axis index (0..5)."""
+        if not (0 <= int(axis_id) < 6):
+            return
+        with self.lock:
+            if pos_estimate is not None:
+                try:
+                    self.axes_pos_estimate[axis_id] = float(pos_estimate)
+                except Exception:
+                    pass
+            if vel_estimate is not None:
+                try:
+                    self.axes_vel_estimate[axis_id] = float(vel_estimate)
+                except Exception:
+                    pass
+            if bus_voltage is not None:
+                try:
+                    self.axes_bus_voltage[axis_id] = float(bus_voltage)
+                except Exception:
+                    pass
+
+    def get_bus_voltage(self):
+        """Return list of bus voltage values (may contain None)."""
+        with self.lock:
+            return list(self.axes_bus_voltage)
+
     def set_axes(self, positions):
         if not isinstance(positions, (list, tuple)) or len(positions) != 6:
             raise ValueError("positions must be length-6 list/tuple")
@@ -157,21 +185,6 @@ class RobotState:
     def get_state_version(self):
         with self.lock:
             return self.state_version
-
-    def set_axis_feedback(self, axis_id: int, pos_estimate=None, vel_estimate=None):
-        if not (0 <= int(axis_id) < 6):
-            return
-        with self.lock:
-            if pos_estimate is not None:
-                try:
-                    self.axes_pos_estimate[axis_id] = float(pos_estimate)
-                except Exception:
-                    pass
-            if vel_estimate is not None:
-                try:
-                    self.axes_vel_estimate[axis_id] = float(vel_estimate)
-                except Exception:
-                    pass
 
     def set_profile(self, profile_points):
         if not isinstance(profile_points, (list, tuple)) or len(profile_points) == 0:
@@ -361,22 +374,29 @@ class ODriveCANBridge(threading.Thread):
             # Try to decode useful fields
             pos_val = None
             vel_val = None
+            bus_v = None
 
             # Many CanMsg objects have a .data dict with decoded signals
             if hasattr(msg, "data") and isinstance(msg.data, dict):
                 pos_val = msg.data.get("Pos_Estimate")
                 vel_val = msg.data.get("Vel_Estimate")
+                bus_v = msg.data.get("Bus_Voltage")
 
             # Some versions may use .signals instead
             if pos_val is None and hasattr(msg, "signals"):
                 pos_val = msg.signals.get("Pos_Estimate")
             if vel_val is None and hasattr(msg, "signals"):
                 vel_val = msg.signals.get("Vel_Estimate")
+            if bus_v is None and hasattr(msg, "signals"):
+                bus_v = msg.signals.get("Bus_Voltage")
 
             #logger.debug(f"[ODRV] axis {axis_id} decoded pos={pos_val}, vel={vel_val}")
 
             if pos_val is not None or vel_val is not None:
                 self.state.set_axis_feedback(axis_id, pos_estimate=pos_val, vel_estimate=vel_val)
+            if bus_v is not None:
+                self.state.set_bus_voltage(bus_v)
+
         except Exception as e:
             logger.exception(f"[ODRV] Exception in _on_feedback for axis {axis_id}: {e}")
 
@@ -466,10 +486,12 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
                 controller_addr = (controller_ip, UDP_TELEM_PORT)
                 fb_pos = state.get_pos_fbk()
                 fb_vel = state.get_vel_fbk()
+                bus_v = state.get_bus_voltage()
                 msg = {
                     "t": time.time(),
                     "pos": [None if v is None else float(v) for v in fb_pos],
                     "vel": [None if v is None else float(v) for v in fb_vel],
+                    "bus_v": [None if v is None else float(v) for v in bus_v],
                 }
                 udp_sock.sendto(json.dumps(msg).encode("utf-8"), controller_addr)
         except Exception as e:

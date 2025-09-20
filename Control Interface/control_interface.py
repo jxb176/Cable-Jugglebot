@@ -331,6 +331,8 @@ class RobotGUI(QWidget):
 
             if isinstance(telem, dict):
                 t = float(telem.get("t", time.time()))
+
+                # Position & velocity
                 if "pos" in telem or "vel" in telem:
                     pos = telem.get("pos", self.last_pos)
                     vel = telem.get("vel", self.last_vel)
@@ -362,11 +364,33 @@ class RobotGUI(QWidget):
                         self.xdata = self.xdata[-200:]
                         self.ydata = self.ydata[-200:]
                         self.ydata_vel = self.ydata_vel[-200:]
+                # Bus voltage array
+                if "bus_v" in telem:
+                    vbus = telem.get("bus_v", [])
+                    if isinstance(vbus, list) and len(vbus) >= 1:
+                        if vbus[0] is not None:
+                            self.busv_label.setText(f"Bus Voltage (A1): {float(vbus[0]):.2f} V")
+                            self.vbus_x.append(t - self.start_time)
+                            self.vbus_y.append(float(vbus[0]))
+                            if len(self.vbus_x) > 200:
+                                self.vbus_x = self.vbus_x[-200:]
+                                self.vbus_y = self.vbus_y[-200:]
+            elif isinstance(telem, (tuple, list)) and len(telem) >= 2:
+                try:
+                    t = float(telem[0])
+                    val = float(telem[1])
+                except Exception:
+                    continue
+                self.xdata.append(t - self.start_time)
+                self.ydata.append(val)
+                if len(self.xdata) > 200:
+                    self.xdata = self.xdata[-200:]
+                    self.ydata = self.ydata[-200:]
 
         # Update plots
         self.curve_pos.setData(self.xdata, self.ydata)
         self.curve_vel.setData(self.xdata, self.ydata_vel)
-
+        self.busv_curve.setData(self.vbus_x, self.vbus_y)
 
 
 # --- Simulated Robot ---  # (not used when connected to real robot)
