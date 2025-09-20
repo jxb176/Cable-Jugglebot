@@ -175,7 +175,7 @@ class RobotState:
         self.telem_stop.clear()
         t = threading.Thread(
             target=udp_telemetry_sender,
-            args=(self, udp_sock, controller_addr, self.telem_stop),
+            args=(self, udp_sock, self.telem_stop),
             daemon=True,
         )
         self.telem_thread = t
@@ -337,20 +337,24 @@ class ODriveCANBridge(threading.Thread):
 
 
 
-def udp_telemetry_sender(state: RobotState, udp_sock, controller_addr, stop_event):
+def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
     while not stop_event.is_set():
         try:
-            fb_pos = state.get_pos_fbk()
-            fb_vel = state.get_vel_fbk()
-            msg = {
-                "t": time.time(),
-                "pos": [None if v is None else float(v) for v in fb_pos],
-                "vel": [None if v is None else float(v) for v in fb_vel],
-            }
-            udp_sock.sendto(json.dumps(msg).encode("utf-8"), controller_addr)
+            controller_ip = state.get_controller_ip()
+            if controller_ip:
+                controller_addr = (controller_ip, UDP_TELEM_PORT)
+                fb_pos = state.get_pos_fbk()
+                fb_vel = state.get_vel_fbk()
+                msg = {
+                    "t": time.time(),
+                    "pos": [None if v is None else float(v) for v in fb_pos],
+                    "vel": [None if v is None else float(v) for v in fb_vel],
+                }
+                udp_sock.sendto(json.dumps(msg).encode("utf-8"), controller_addr)
         except Exception as e:
             logger.error(f"[UDP] Error sending telemetry: {e}")
         time.sleep(1.0 / TELEMETRY_RATE_HZ)
+
 
 
 def axes_state_logger(state: RobotState):
@@ -379,6 +383,7 @@ def tcp_command_server(state: RobotState):
     logger.info(f"[TCP] Listening on :{TCP_CMD_PORT}")
     while True:
         conn, addr = srv.accept()
+        state.set_controller_ip(addr[0])  # <-- save controller IP
         logger.info(f"[TCP] Controller connected from {addr}")
         state.set_controller_ip(addr[0])
 

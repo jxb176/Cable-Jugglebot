@@ -21,8 +21,6 @@ import pyqtgraph as pg
 ROBOT_HOST = "jugglepi.local"  # <-- set to your Raspberry Pi IP or hostname
 TCP_CMD_PORT = 5555
 UDP_TELEM_PORT = 5556
-# Telemetry connection timeout (seconds)
-TELEMETRY_TIMEOUT = 2.0
 
 def _queue_put_latest(q: Queue, item):
     """Keep only the newest item in the queue."""
