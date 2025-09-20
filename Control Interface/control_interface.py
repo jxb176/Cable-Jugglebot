@@ -142,8 +142,7 @@ class RobotGUI(QWidget):
             spin.setRange(-10.0, 10.0)
             spin.setSingleStep(0.01)
             spin.setValue(0.0)
-            # Send an axes command on any change
-            spin.valueChanged.connect(self.send_axes)
+            spin.valueChanged.connect(self.send_axes)  # Send axes command on change
             row.addWidget(lbl)
             row.addWidget(spin)
             axes_layout.addLayout(row)
@@ -180,7 +179,7 @@ class RobotGUI(QWidget):
             self.fb_labels.append((val_pos, val_vel))
         layout.addLayout(fb_layout)
 
-        # Profile controls: dropdown + send + start + rate
+        # Profile controls
         prof_layout = QHBoxLayout()
         self.profile_combo = QComboBox()
         self.profile_refresh_btn = QPushButton("Refresh")
@@ -203,41 +202,48 @@ class RobotGUI(QWidget):
         prof_layout.addWidget(self.profile_start_btn)
         layout.addLayout(prof_layout)
 
-        # --- Telemetry plot ---
-        self.plot = pg.PlotWidget(title="Telemetry Data (Sensor Value)")
-        self.plot.setLabel('bottom', 'Time', 's')
-        self.plot.setLabel('left', 'Value')
-        self.plot.showGrid(x=True, y=True)
+        # --- Telemetry plots ---
+        # Position plot
+        self.plot_pos = pg.PlotWidget(title="Axis 1 Position (turns)")
+        self.plot_pos.setLabel('bottom', 'Time', 's')
+        self.plot_pos.setLabel('left', 'Position', 'turns')
+        self.plot_pos.showGrid(x=True, y=True)
+        self.curve_pos = self.plot_pos.plot(pen='y')
+        layout.addWidget(self.plot_pos)
 
-        self.curve = self.plot.plot(pen='y')
-        layout.addWidget(self.plot)
+        # Velocity plot
+        self.plot_vel = pg.PlotWidget(title="Axis 1 Velocity (turns/s)")
+        self.plot_vel.setLabel('bottom', 'Time', 's')
+        self.plot_vel.setLabel('left', 'Velocity', 'turns/s')
+        self.plot_vel.showGrid(x=True, y=True)
+        self.curve_vel = self.plot_vel.plot(pen='c')
+        layout.addWidget(self.plot_vel)
 
         self.setLayout(layout)
 
-        # Data buffer
+        # Data buffers
         self.xdata = []
-        self.ydata = []
+        self.ydata = []       # position data
+        self.ydata_vel = []   # velocity data
         self.start_time = time.time()
         self.last_pos = [0.0]*6
         self.last_vel = [0.0]*6
-        self.last_telem_time = 0  # timestamp of last received telemetry
+        self.last_telem_time = 0
         self.telem_timeout = 2.0  # seconds
 
-        # Initialize profile dropdown (Profiles subfolder)
+        # Initialize profile dropdown
         self.populate_profile_dropdown()
 
-        # Timer to refresh GUI
+        # Timers
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_gui)
         self.timer.start(100)  # update every 100 ms
 
-        # Timer to check telemetry connection status
         self.conn_timer = QTimer()
         self.conn_timer.timeout.connect(self.check_connection_status)
-        self.conn_timer.start(500)  # check every 0.5s
+        self.conn_timer.start(500)  # check every 0.5 s
 
     def check_connection_status(self):
-        """Update connection status label based on last telemetry time."""
         now = time.time()
         if self.last_telem_time == 0 or (now - self.last_telem_time) > self.telem_timeout:
             self.status_label.setText("⚠️ Waiting for telemetry…")
@@ -245,32 +251,27 @@ class RobotGUI(QWidget):
             self.status_label.setText("✅ Connected (telemetry streaming)")
 
     def _profiles_dir(self) -> str:
-        """Return absolute path to the Profiles subfolder, creating it if missing."""
         base = os.getcwd()
         pdir = os.path.join(base, "Profiles")
         os.makedirs(pdir, exist_ok=True)
         return pdir
 
     def send_axes(self, *_):
-        """Send 6-axis position command in turns."""
         positions = [float(sp.value()) for sp in self.axis_spins]
         cmd = {"type": "axes", "positions": positions, "units": "turns"}
         _queue_put_latest(self.cmd_queue, cmd)
 
     def send_state(self, state_value: str):
-        """Send robot state command."""
         cmd = {"type": "state", "value": state_value}
         _queue_put_latest(self.cmd_queue, cmd)
 
     def _load_csv_as_profile(self, path: str):
-        """Load CSV profile with rows: time, axis1..axis6."""
         rows = []
         with open(path, "r", newline="") as f:
             reader = csv.reader(f)
             rows = [r for r in reader if any(cell.strip() for cell in r)]
         if not rows:
             raise ValueError("empty CSV")
-        # Skip header if first cell not numeric
         start_idx = 0
         try:
             float(rows[0][0])
@@ -283,14 +284,12 @@ class RobotGUI(QWidget):
             t = float(r[0])
             axes = [float(x) for x in r[1:7]]
             profile_rows.append([t] + axes)
-        # Ensure monotonic non-decreasing time
         times = [row[0] for row in profile_rows]
         if any(t2 < t1 for t1, t2 in zip(times, times[1:])):
             raise ValueError("time column must be non-decreasing")
         return profile_rows
 
     def populate_profile_dropdown(self):
-        """Scan Profiles subdirectory for CSV files and populate the dropdown."""
         pdir = self._profiles_dir()
         csvs = sorted([f for f in os.listdir(pdir) if f.lower().endswith(".csv")])
         self.profile_combo.clear()
@@ -303,7 +302,6 @@ class RobotGUI(QWidget):
                 self.profile_combo.addItem(f)
 
     def on_send_profile(self):
-        """Parse selected CSV from Profiles and send it to the robot server."""
         if not self.profile_combo.isEnabled():
             self.status_label.setText("No CSV profile to send (Profiles/ empty)")
             return
@@ -321,28 +319,23 @@ class RobotGUI(QWidget):
             self.status_label.setText(f"Profile send failed: {e}")
 
     def on_start_profile(self):
-        """Send a profile_start with selected rate."""
         rate = float(self.profile_rate.value())
         cmd = {"type": "profile_start", "rate_hz": rate}
         _queue_put_latest(self.cmd_queue, cmd)
         self.status_label.setText(f"Profile start requested at {rate:.1f} Hz")
 
     def update_gui(self):
-        """Check telemetry and update GUI."""
         while not self.telem_queue.empty():
             telem = self.telem_queue.get()
             self.last_telem_time = time.time()
 
-            # --- Dict telemetry (new format) ---
             if isinstance(telem, dict):
                 t = float(telem.get("t", time.time()))
-
-                # Array format: {"pos":[...], "vel":[...]}
                 if "pos" in telem or "vel" in telem:
                     pos = telem.get("pos", self.last_pos)
                     vel = telem.get("vel", self.last_vel)
 
-                    # Update feedback labels (None -> '---')
+                    # Update feedback labels
                     for i in range(6):
                         p = pos[i] if (isinstance(pos, list) and i < len(pos)) else None
                         v = vel[i] if (isinstance(vel, list) and i < len(vel)) else None
@@ -351,44 +344,29 @@ class RobotGUI(QWidget):
                         self.fb_labels[i][0].setText(p_text)
                         self.fb_labels[i][1].setText(v_text)
 
-                    # Cache last arrays (None -> NaN)
+                    # Cache last values
                     if isinstance(pos, list) and len(pos) >= 6:
                         self.last_pos = [(float(x) if x is not None else float("nan")) for x in pos[:6]]
                     if isinstance(vel, list) and len(vel) >= 6:
                         self.last_vel = [(float(x) if x is not None else float("nan")) for x in vel[:6]]
 
-                    # Plot axis 1 pos
+                    # Append data for axis 1
                     self.xdata.append(t - self.start_time)
                     a1 = self.last_pos[0] if self.last_pos and self.last_pos[0] == self.last_pos[0] else 0.0
+                    v1 = self.last_vel[0] if self.last_vel and self.last_vel[0] == self.last_vel[0] else 0.0
                     self.ydata.append(a1)
+                    self.ydata_vel.append(v1)
+
+                    # Trim buffers
                     if len(self.xdata) > 200:
                         self.xdata = self.xdata[-200:]
                         self.ydata = self.ydata[-200:]
+                        self.ydata_vel = self.ydata_vel[-200:]
 
-                # Legacy single value dict: {"val": <float>}
-                elif "val" in telem:
-                    val = float(telem["val"])
-                    self.xdata.append(t - self.start_time)
-                    self.ydata.append(val)
-                    if len(self.xdata) > 200:
-                        self.xdata = self.xdata[-200:]
-                        self.ydata = self.ydata[-200:]
+        # Update plots
+        self.curve_pos.setData(self.xdata, self.ydata)
+        self.curve_vel.setData(self.xdata, self.ydata_vel)
 
-            # --- Legacy tuple format: (t, val) ---
-            elif isinstance(telem, (tuple, list)) and len(telem) >= 2:
-                try:
-                    t = float(telem[0])
-                    val = float(telem[1])
-                except Exception:
-                    continue
-                self.xdata.append(t - self.start_time)
-                self.ydata.append(val)
-                if len(self.xdata) > 200:
-                    self.xdata = self.xdata[-200:]
-                    self.ydata = self.ydata[-200:]
-
-        # --- Update plot ---
-        self.curve.setData(self.xdata, self.ydata)
 
 
 # --- Simulated Robot ---  # (not used when connected to real robot)

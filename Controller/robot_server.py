@@ -173,6 +173,23 @@ class RobotState:
                 except Exception:
                     pass
 
+    def set_profile(self, profile_points):
+        if not isinstance(profile_points, (list, tuple)) or len(profile_points) == 0:
+            raise ValueError("profile must be a non-empty list")
+        prof = []
+        for row in profile_points:
+            if not isinstance(row, (list, tuple)) or len(row) < 7:
+                raise ValueError("each profile row must be [t, a1..a6]")
+            t = float(row[0])
+            axes = [float(x) for x in row[1:7]]
+            prof.append((t, axes))
+        times = [p[0] for p in prof]
+        if any(t2 < t1 for t1, t2 in zip(times, times[1:])):
+            raise ValueError("profile time column must be non-decreasing")
+        with self.lock:
+            self.profile = prof
+        logger.info(f"Profile uploaded: {len(prof)} points, duration {prof[-1][0] - prof[0][0]:.3f}s")
+
     # --- Telemetry lifecycle ---
     def start_telem(self, udp_sock, controller_addr):
         self.stop_telem()
