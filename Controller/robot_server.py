@@ -329,27 +329,33 @@ class ODriveCANBridge(threading.Thread):
     def stop(self):
         self._stop.set()
         if self.manager:
-            self.manager.close()
+            try:
+                self.manager.close()
+            except Exception:
+                pass
 
     def run(self):
         logger.info("[ODRV] Starting ODriveCanManager…")
         try:
+            # one bus, one listener
             self.manager = ODriveCanManager("can0")
 
+            # register all axes + callbacks
             for aid in self.axis_ids:
                 axis = self.manager.add_axis(aid)
 
-                # encoder callback
+                # encoder callback -> update RobotState
                 axis.on_encoder(lambda pos, vel, i=aid:
                     self.state.set_axis_feedback(i, pos_estimate=pos, vel_estimate=vel))
 
-                # bus voltage callback
+                # bus voltage callback -> update RobotState
                 axis.on_bus(lambda vbus, ibus, i=aid:
                     self.state.set_axis_feedback(i, bus_voltage=vbus))
 
                 logger.info(f"[ODRV] axis {aid} registered callbacks")
 
-            # main loop
+            # main loop (~500 Hz)
+            last_log = time.perf_counter()
             while not self._stop.is_set():
                 st = self.state.get_state()
                 sv = self.state.get_state_version()
@@ -364,25 +370,35 @@ class ODriveCANBridge(threading.Thread):
                     pos_cmd = self.state.get_pos_cmd()
                     for i, aid in enumerate(self.axis_ids):
                         try:
-                            axis = self.manager.axes[aid]
-                            axis.set_input_pos(pos_cmd[i])
+                            axis = self.manager.axes.get(aid)
+                            if axis is not None:
+                                axis.set_input_pos(pos_cmd[i])
                         except Exception as e:
                             logger.warning(f"[ODRV] axis {aid} set_input_pos failed: {e}")
 
-                time.sleep(0.002)  # ~500 Hz loop
+                # light heartbeat log
+                now = time.perf_counter()
+                if now - last_log >= 1.0:
+                    logger.info(f"[ODRV] streaming {len(self.axis_ids)} axes, state={st}")
+                    last_log = now
+
+                time.sleep(0.002)  # ~500 Hz
 
         except Exception as e:
             logger.error(f"[ODRV] Bridge error: {e}")
         finally:
             if self.manager:
-                self.manager.close()
+                try:
+                    self.manager.close()
+                except Exception:
+                    pass
             logger.info("[ODRV] Manager stopped")
 
     def _apply_state(self, st: str):
         """Apply high-level state to all axes."""
         try:
             for aid in self.axis_ids:
-                axis = self.manager.axes.get(aid)
+                axis = self.manager.axes.get(aid) if self.manager else None
                 if not axis:
                     continue
                 if st == "enable":
@@ -394,138 +410,6 @@ class ODriveCANBridge(threading.Thread):
         except Exception as e:
             logger.error(f"[ODRV] _apply_state error: {e}")
 
-
-    def _on_feedback(self, axis_id: int, msg):
-        """
-        Handle feedback from a single axis.
-
-        msg is a CanMsg object from odrive_can.
-        """
-
-        # Debugging
-        if hasattr(msg, "data") and isinstance(msg.data, dict):
-            logger.debug(f"[ODRV] axis {axis_id} msg.data keys: {list(msg.data.keys())}")
-        if hasattr(msg, "signals"):
-            logger.debug(f"[ODRV] axis {axis_id} msg.signals keys: {list(msg.signals.keys())}")
-
-        try:
-            # Try to decode useful fields
-            pos_val = None
-            vel_val = None
-            bus_v = None
-
-            # Check msg.data (preferred)
-            if hasattr(msg, "data") and isinstance(msg.data, dict):
-                pos_val = msg.data.get("Pos_Estimate")
-                vel_val = msg.data.get("Vel_Estimate")
-                bus_v = (
-                        msg.data.get("Bus_Voltage")
-                        or msg.data.get("Vbus_Voltage")
-                        or msg.data.get("Vbus")
-                )
-
-            # Check msg.signals (fallback)
-            if pos_val is None and hasattr(msg, "signals"):
-                pos_val = msg.signals.get("Pos_Estimate")
-            if vel_val is None and hasattr(msg, "signals"):
-                vel_val = msg.signals.get("Vel_Estimate")
-            if bus_v is None and hasattr(msg, "signals"):
-                bus_v = (
-                        msg.signals.get("Bus_Voltage")
-                        or msg.signals.get("Vbus_Voltage")
-                        or msg.signals.get("Vbus")
-                )
-
-            # Store whatever we got
-            if pos_val is not None or vel_val is not None or bus_v is not None:
-                self.state.set_axis_feedback(
-                    axis_id,
-                    pos_estimate=pos_val,
-                    vel_estimate=vel_val,
-                    bus_voltage=bus_v,
-                )
-
-            # Debug: show what keys are in the message
-            # logger.debug(f"[ODRV] axis {axis_id} msg keys: {list(getattr(msg, 'data', {}).keys())}")
-
-        except Exception as e:
-            logger.exception(f"[ODRV] Exception in _on_feedback for axis {axis_id}: {e}")
-
-    async def _apply_state(self, st: str):
-        """Apply high-level state (enable/disable/estop) to all axes."""
-        if not self._drivers:
-            return
-
-        try:
-            if st == "enable":
-                for idx, (aid, drv) in enumerate(self._drivers):
-                    logger.info(f"[ODRV] axis {aid}: enabling CLOSED_LOOP_CONTROL")
-                    try:
-                        await drv.set_axis_state("CLOSED_LOOP_CONTROL")
-                        cmd = self.state.get_pos_cmd()
-                        setp = float(cmd[idx]) if idx < len(cmd) else 0.0
-                        drv.set_input_pos(setp)
-                    except Exception as e:
-                        logger.warning(f"[ODRV] axis {aid} enable failed: {e}")
-
-            elif st in ("disable", "estop"):
-                for aid, drv in self._drivers:
-                    logger.info(f"[ODRV] axis {aid}: setting IDLE")
-                    try:
-                        await drv.set_axis_state("IDLE")
-                    except Exception as e:
-                        logger.warning(f"[ODRV] axis {aid} disable failed: {e}")
-        except Exception as e:
-            logger.error(f"[ODRV] _apply_state('{st}') failed: {e}")
-
-    async def _stream_positions(self):
-        """Main loop: stream commands + log feedback."""
-        dt_cmd = 1.0 / max(1e-3, ODRIVE_COMMAND_RATE_HZ)
-        dt_log = 1.0 / max(1e-3, ODRIVE_LOG_RATE_HZ)
-        last_cmd = time.perf_counter()
-        last_log = time.perf_counter()
-
-        while not self._stop.is_set():
-            now = time.perf_counter()
-            st = self.state.get_state()
-            sv = self.state.get_state_version()
-
-            # Handle state change
-            if sv != self._applied_state_version:
-                await self._apply_state(st)
-                self._applied_state_version = sv
-
-            # Send setpoints if enabled
-            if self._drivers and st == "enable" and (now - last_cmd) >= dt_cmd:
-                positions = self.state.get_pos_cmd()
-                for i, (aid, drv) in enumerate(self._drivers):
-                    try:
-                        drv.set_input_pos(float(positions[i]))
-                    except Exception as e:
-                        logger.error(f"[ODRV] axis {aid} set_input_pos failed: {e}")
-                last_cmd = now
-
-            # Periodic log
-            if (now - last_log) >= dt_log:
-                logger.info(f"[ODRV] streaming {len(self._drivers)} axes, state={st}")
-                last_log = now
-
-            await asyncio.sleep(0.002)
-
-    async def _run_async(self):
-        """Async entry point for the bridge."""
-        logger.info("[ODRV] _run_async starting _start_all")
-        await self._start_all()
-        logger.info("[ODRV] _run_async finished _start_all, entering _stream_positions")
-        await self._stream_positions()
-
-    def run(self):
-        """Thread entry point — runs an asyncio loop."""
-        logger.info("[ODRV] ODriveCANBridge thread started, entering asyncio.run")
-        try:
-            asyncio.run(self._run_async())
-        except Exception as e:
-            logger.error(f"[ODRV] asyncio loop error: {e}")
 
 
 
