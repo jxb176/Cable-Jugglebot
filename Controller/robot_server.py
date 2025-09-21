@@ -345,7 +345,22 @@ class ODriveCANBridge(threading.Thread):
                         self._on_feedback(aid, msg)
                     return cb
 
+                def make_bus_cb(aid):
+                    def cb(msg, caller=None):
+                        try:
+                            if hasattr(msg, "data") and isinstance(msg.data, dict):
+                                vbus = msg.data.get("Bus_Voltage")
+                                if vbus is not None:
+                                    self.state.set_axis_feedback(aid, bus_voltage=vbus)
+                                    logger.debug(f"[ODRV] axis {aid} bus voltage={vbus:.2f} V")
+                        except Exception as e:
+                            logger.exception(f"[ODRV] Exception in bus_cb for axis {aid}: {e}")
+
+                    return cb
+
                 drv.feedback_callback = make_feedback_cb(axis_id)
+                drv.bus_voltage_callback = make_bus_cb(axis_id)  # if odrive_can exposes a way
+
                 try:
                     logger.info(f"[ODRV] axis {axis_id}: starting driver")
                     await asyncio.wait_for(drv.start(), timeout=1.0)
