@@ -376,29 +376,39 @@ class ODriveCANBridge(threading.Thread):
             vel_val = None
             bus_v = None
 
-            # Many CanMsg objects have a .data dict with decoded signals
+            # Check msg.data (preferred)
             if hasattr(msg, "data") and isinstance(msg.data, dict):
                 pos_val = msg.data.get("Pos_Estimate")
                 vel_val = msg.data.get("Vel_Estimate")
-                bus_v = msg.data.get("Bus_Voltage")
+                bus_v = (
+                        msg.data.get("Bus_Voltage")
+                        or msg.data.get("Vbus_Voltage")
+                        or msg.data.get("Vbus")
+                )
 
-            # Some versions may use .signals instead
+            # Check msg.signals (fallback)
             if pos_val is None and hasattr(msg, "signals"):
                 pos_val = msg.signals.get("Pos_Estimate")
             if vel_val is None and hasattr(msg, "signals"):
                 vel_val = msg.signals.get("Vel_Estimate")
             if bus_v is None and hasattr(msg, "signals"):
-                bus_v = msg.signals.get("Bus_Voltage")
+                bus_v = (
+                        msg.signals.get("Bus_Voltage")
+                        or msg.signals.get("Vbus_Voltage")
+                        or msg.signals.get("Vbus")
+                )
 
-            #logger.debug(f"[ODRV] axis {axis_id} decoded pos={pos_val}, vel={vel_val}")
-
-            if (pos_val is not None) or (vel_val is not None) or (bus_v is not None):
+            # Store whatever we got
+            if pos_val is not None or vel_val is not None or bus_v is not None:
                 self.state.set_axis_feedback(
                     axis_id,
-                    pos_estimate = pos_val,
-                    vel_estimate = vel_val,
-                    bus_voltage = bus_v,
+                    pos_estimate=pos_val,
+                    vel_estimate=vel_val,
+                    bus_voltage=bus_v,
                 )
+
+            # Debug: show what keys are in the message
+            # logger.debug(f"[ODRV] axis {axis_id} msg keys: {list(getattr(msg, 'data', {}).keys())}")
 
         except Exception as e:
             logger.exception(f"[ODRV] Exception in _on_feedback for axis {axis_id}: {e}")
