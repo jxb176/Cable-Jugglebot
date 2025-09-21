@@ -8,7 +8,7 @@ import logging
 from datetime import datetime
 import subprocess
 import asyncio
-from odrive_can_simple import ODriveCanManager, AxisState  # <-- your new module
+from ODriveCANSimple import ODriveCanManager, AxisState  # <-- your new module
 from typing import List, Tuple
 
 TCP_CMD_PORT = 5555
