@@ -230,6 +230,17 @@ class RobotGUI(QWidget):
         self.busv_curve = self.busv_plot.plot(pen='c')
         layout.addWidget(self.busv_plot)
 
+        # Bus Current label + plot   <-- add
+        self.busi_label = QLabel("Bus Current (A1): -- A")
+        layout.addWidget(self.busi_label)
+
+        self.busi_plot = pg.PlotWidget(title="Bus Current (A)")
+        self.busi_plot.setLabel('bottom', 'Time', 's')
+        self.busi_plot.setLabel('left', 'Current', 'A')
+        self.busi_plot.showGrid(x=True, y=True)
+        self.busi_curve = self.busi_plot.plot(pen='m')
+        layout.addWidget(self.busi_plot)
+
         self.setLayout(layout)
 
         # Data buffers
@@ -238,6 +249,7 @@ class RobotGUI(QWidget):
         self.ydata_vel = []   # velocity data
         self.vbus_x = []  # bus voltage time axis
         self.vbus_y = []  # bus voltage values
+        self.busi_x, self.busi_y = [], []
 
         self.start_time = time.time()
         self.last_pos = [0.0]*6
@@ -389,6 +401,17 @@ class RobotGUI(QWidget):
                             if len(self.vbus_x) > 200:
                                 self.vbus_x = self.vbus_x[-200:]
                                 self.vbus_y = self.vbus_y[-200:]
+                # Bus current array
+                if "bus_i" in telem:
+                    busi = telem.get("bus_i", [])
+                    if isinstance(busi, list) and len(busi) >= 1:
+                        if busi[0] is not None:
+                            self.busi_label.setText(f"Bus Current (A1): {float(busi[0]):.2f} A")
+                            self.busi_x.append(t - self.start_time)
+                            self.busi_y.append(float(busi[0]))
+                            if len(self.busi_x) > 200:
+                                self.busi_x = self.busi_x[-200:]
+                                self.busi_y = self.busi_y[-200:]
             elif isinstance(telem, (tuple, list)) and len(telem) >= 2:
                 try:
                     t = float(telem[0])
@@ -405,7 +428,7 @@ class RobotGUI(QWidget):
         self.curve_pos.setData(self.xdata, self.ydata)
         self.curve_vel.setData(self.xdata, self.ydata_vel)
         self.busv_curve.setData(self.vbus_x, self.vbus_y)
-
+        self.busi_curve.setData(self.busi_x, self.busi_y)
 
 # --- Simulated Robot ---  # (not used when connected to real robot)
 # def robot_sim(cmd_queue, telem_queue):

@@ -113,6 +113,7 @@ class RobotState:
         self.axes_pos_estimate = [None] * 6
         self.axes_vel_estimate = [None] * 6
         self.axes_bus_voltage = [None] * 6
+        self.axes_bus_current = [None] * 6
         self.telem_thread = None
         self.telem_stop = threading.Event()
 
@@ -137,7 +138,7 @@ class RobotState:
         with self.lock:
             return list(self.axes_vel_estimate)
 
-    def set_axis_feedback(self, axis_id: int, pos_estimate=None, vel_estimate=None, bus_voltage=None):
+    def set_axis_feedback(self, axis_id: int, pos_estimate=None, vel_estimate=None, bus_voltage=None, bus_current=None):
         """Store measured feedback for a single axis index (0..5)."""
         if not (0 <= int(axis_id) < 6):
             return
@@ -157,11 +158,20 @@ class RobotState:
                     self.axes_bus_voltage[axis_id] = float(bus_voltage)
                 except Exception:
                     pass
+            if bus_current is not None:  # <-- new
+                try:
+                    self.axes_bus_current[axis_id] = float(bus_current)
+                except Exception:
+                    pass
 
     def get_bus_voltage(self):
         """Return list of bus voltage values (may contain None)."""
         with self.lock:
             return list(self.axes_bus_voltage)
+
+    def get_bus_current(self):
+        with self.lock:
+            return list(self.axes_bus_current)
 
     def set_axes(self, positions):
         if not isinstance(positions, (list, tuple)) or len(positions) != 6:
@@ -350,7 +360,7 @@ class ODriveCANBridge(threading.Thread):
 
                 # bus voltage callback -> update RobotState
                 axis.on_bus(lambda vbus, ibus, i=aid:
-                    self.state.set_axis_feedback(i, bus_voltage=vbus))
+                    self.state.set_axis_feedback(i, bus_voltage=vbus, bus_current=ibus))
 
                 logger.info(f"[ODRV] axis {aid} registered callbacks")
 
@@ -422,11 +432,13 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
                 fb_pos = state.get_pos_fbk()
                 fb_vel = state.get_vel_fbk()
                 bus_v = state.get_bus_voltage() or []
+                bus_i = state.get_bus_current() or []
                 msg = {
                     "t": time.time(),
                     "pos": [None if v is None else float(v) for v in fb_pos],
                     "vel": [None if v is None else float(v) for v in fb_vel],
                     "bus_v": [None if v is None else float(v) for v in bus_v],
+                    "bus_i": [None if i is None else float(i) for i in bus_i],
                 }
                 udp_sock.sendto(json.dumps(msg).encode("utf-8"), controller_addr)
         except Exception as e:
@@ -441,17 +453,20 @@ def axes_state_logger(state: RobotState):
             pos = state.get_pos_fbk()
             vel = state.get_vel_fbk()
             bus = state.get_bus_voltage()
+            busi = state.get_bus_current()
             st = state.get_state()
 
             fmt_pos = ", ".join("---" if x is None else f"{x:.3f}" for x in pos)
             fmt_vel = ", ".join("---" if v is None else f"{v:.3f}" for v in vel)
             fmt_bus = ", ".join("---" if b is None else f"{b:.2f}" for b in bus)
+            fmt_busi = ", ".join("---" if i is None else f"{i:.2f}" for i in busi)
 
             logger.info(
                 f"[LOG] State={st} "
                 f"Pos=[{fmt_pos}] "
                 f"Vel=[{fmt_vel}] "
                 f"BusV=[{fmt_bus}]"
+                f"BusI=[{fmt_busi}]"
             )
         except Exception as e:
             logger.error(f"[LOG] Error: {e}")
