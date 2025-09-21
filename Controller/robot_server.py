@@ -324,6 +324,7 @@ class ODriveCANBridge(threading.Thread):
         self.axis_ids = axis_ids or [0, 1, 2, 3, 4, 5]
         self.manager = None
         self._stop = threading.Event()
+        self._applied_state_version = -1  # track changes
 
     def stop(self):
         self._stop.set()
@@ -348,9 +349,18 @@ class ODriveCANBridge(threading.Thread):
 
                 logger.info(f"[ODRV] axis {aid} registered callbacks")
 
-            # main loop: stream setpoints
+            # main loop
             while not self._stop.is_set():
-                if self.state.get_state() == "enable":
+                st = self.state.get_state()
+                sv = self.state.get_state_version()
+
+                # Apply state transitions when version changes
+                if sv != self._applied_state_version:
+                    self._apply_state(st)
+                    self._applied_state_version = sv
+
+                # Stream setpoints if enabled
+                if st == "enable":
                     pos_cmd = self.state.get_pos_cmd()
                     for i, aid in enumerate(self.axis_ids):
                         try:
@@ -358,7 +368,8 @@ class ODriveCANBridge(threading.Thread):
                             axis.set_input_pos(pos_cmd[i])
                         except Exception as e:
                             logger.warning(f"[ODRV] axis {aid} set_input_pos failed: {e}")
-                time.sleep(0.002)  # ~500 Hz
+
+                time.sleep(0.002)  # ~500 Hz loop
 
         except Exception as e:
             logger.error(f"[ODRV] Bridge error: {e}")
@@ -366,6 +377,23 @@ class ODriveCANBridge(threading.Thread):
             if self.manager:
                 self.manager.close()
             logger.info("[ODRV] Manager stopped")
+
+    def _apply_state(self, st: str):
+        """Apply high-level state to all axes."""
+        try:
+            for aid in self.axis_ids:
+                axis = self.manager.axes.get(aid)
+                if not axis:
+                    continue
+                if st == "enable":
+                    logger.info(f"[ODRV] axis {aid}: enabling CLOSED_LOOP_CONTROL")
+                    axis.set_axis_state(AxisState.CLOSED_LOOP_CONTROL)
+                elif st in ("disable", "estop"):
+                    logger.info(f"[ODRV] axis {aid}: setting IDLE")
+                    axis.set_axis_state(AxisState.IDLE)
+        except Exception as e:
+            logger.error(f"[ODRV] _apply_state error: {e}")
+
 
     def _on_feedback(self, axis_id: int, msg):
         """
