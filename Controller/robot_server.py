@@ -8,6 +8,7 @@ import logging
 from datetime import datetime
 import subprocess
 import asyncio
+from odrive_can_simple import ODriveCanManager, AxisState  # <-- your new module
 from typing import List, Tuple
 
 TCP_CMD_PORT = 5555
@@ -315,72 +316,56 @@ class ProfilePlayer(threading.Thread):
 
 
 class ODriveCANBridge(threading.Thread):
-    """Streams axes targets to ODrive over CAN (async) and logs feedback callbacks."""
+    """Bridge between RobotState and ODrive CAN bus using ODriveCanManager."""
 
-    def __init__(self, state: RobotState):
+    def __init__(self, state: RobotState, canbus="can0", axis_ids=None):
         super().__init__(daemon=True)
         self.state = state
+        self.axis_ids = axis_ids or [0, 1, 2, 3, 4, 5]
+        self.manager = None
         self._stop = threading.Event()
-        self._drivers: list[tuple[int, any]] = []
-        self._applied_state_version = -1
 
     def stop(self):
         self._stop.set()
+        if self.manager:
+            self.manager.close()
 
-    async def _start_all(self):
-        """Initialize all ODriveCAN drivers and attach feedback callbacks."""
-        if odc is None:
-            logger.warning("[ODRV] odrive_can module missing; running in simulation mode")
-            return
+    def run(self):
+        logger.info("[ODRV] Starting ODriveCanManager…")
+        try:
+            self.manager = ODriveCanManager("can0")
 
-        self._drivers = []
-        for axis_id in AXIS_NODE_IDS:
-            try:
-                drv = odc.ODriveCAN(axis_id=axis_id)
+            for aid in self.axis_ids:
+                axis = self.manager.add_axis(aid)
 
-                # Proper callback signature: (msg: CanMsg, caller: ODriveCAN)
-                def make_feedback_cb(aid):
-                    def cb(msg, caller=None):
-                        #logger.debug(f"[ODRV] raw feedback axis {aid}: {msg}")
-                        self._on_feedback(aid, msg)
-                    return cb
+                # encoder callback
+                axis.on_encoder(lambda pos, vel, i=aid:
+                    self.state.set_axis_feedback(i, pos_estimate=pos, vel_estimate=vel))
 
-                def make_bus_cb(aid):
-                    def cb(msg, caller=None):
+                # bus voltage callback
+                axis.on_bus(lambda vbus, ibus, i=aid:
+                    self.state.set_axis_feedback(i, bus_voltage=vbus))
+
+                logger.info(f"[ODRV] axis {aid} registered callbacks")
+
+            # main loop: stream setpoints
+            while not self._stop.is_set():
+                if self.state.get_state() == "enable":
+                    pos_cmd = self.state.get_pos_cmd()
+                    for i, aid in enumerate(self.axis_ids):
                         try:
-                            vbus = None
-                            if hasattr(msg, "data") and isinstance(msg.data, dict):
-                                vbus = msg.data.get("Bus_Voltage")
-                            if vbus is None and hasattr(msg, "signals"):
-                                vbus = msg.signals.get("Bus_Voltage")
-                            if vbus is not None:
-                                self.state.set_axis_feedback(aid, bus_voltage=vbus)
-                                logger.debug(f"[ODRV] axis {aid} bus voltage={vbus:.2f} V")
+                            axis = self.manager.axes[aid]
+                            axis.set_input_pos(pos_cmd[i])
                         except Exception as e:
-                            logger.exception(f"[ODRV] bus voltage cb error: {e}")
+                            logger.warning(f"[ODRV] axis {aid} set_input_pos failed: {e}")
+                time.sleep(0.002)  # ~500 Hz
 
-                    return cb
-
-                drv.feedback_callback = make_feedback_cb(axis_id)
-                drv.add_callback(f"Axis{axis_id}_Get_Bus_Voltage_Current", make_bus_cb(axis_id))
-
-                try:
-                    logger.info(f"[ODRV] axis {axis_id}: starting driver")
-                    await asyncio.wait_for(drv.start(), timeout=1.0)
-                    self._drivers.append((axis_id, drv))
-                    logger.info(f"[ODRV] axis {axis_id}: driver started")
-                except asyncio.TimeoutError:
-                    logger.warning(f"[ODRV] axis {axis_id}: drv.start() timed out")
-                except Exception as e:
-                    logger.warning(f"[ODRV] axis {axis_id} driver init failed: {e}")
-
-            except Exception as e:
-                logger.warning(f"[ODRV] axis {axis_id} driver init failed: {e}")
-
-        if not self._drivers:
-            logger.warning("[ODRV] No drivers successfully initialized")
-        else:
-            logger.info(f"[ODRV] drivers initialized: {[aid for aid, _ in self._drivers]}")
+        except Exception as e:
+            logger.error(f"[ODRV] Bridge error: {e}")
+        finally:
+            if self.manager:
+                self.manager.close()
+            logger.info("[ODRV] Manager stopped")
 
     def _on_feedback(self, axis_id: int, msg):
         """
