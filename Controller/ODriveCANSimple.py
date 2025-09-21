@@ -1,198 +1,104 @@
 import can
-import enum
 import struct
 import threading
+import enum
 
 
 class AxisState(enum.IntEnum):
-    UNDEFINED = 0
     IDLE = 1
-    STARTUP_SEQUENCE = 2
-    FULL_CALIBRATION_SEQUENCE = 3
-    MOTOR_CALIBRATION = 4
-    ENCODER_INDEX_SEARCH = 6
-    ENCODER_OFFSET_CALIBRATION = 7
     CLOSED_LOOP_CONTROL = 8
-    LOCKIN_SPIN = 9
-    ENCODER_DIR_FIND = 10
-    HOMING = 11
-    ENCODER_HALL_POLARITY_CALIBRATION = 12
-    ENCODER_HALL_PHASE_CALIBRATION = 13
-    ANTICOGGING_CALIBRATION = 14
+    # ... add others as needed ...
 
 
-class ControlMode(enum.IntEnum):
-    VOLTAGE_CONTROL = 0
-    TORQUE_CONTROL = 1
-    VELOCITY_CONTROL = 2
-    POSITION_CONTROL = 3
+class ODriveAxis:
+    def __init__(self, axis_id, manager):
+        self.axis_id = axis_id
+        self.manager = manager
+        self.callbacks = {"encoder": None, "bus": None, "iq": None}
 
+    # ---------------- Commands ----------------
+    def set_axis_state(self, state: AxisState):
+        self.manager._send(self.axis_id, 0x07, int(state).to_bytes(4, "little"))
 
-class InputMode(enum.IntEnum):
-    INACTIVE = 0
-    PASSTHROUGH = 1
-    VEL_RAMP = 2
-    POS_FILTER = 3
-    MIX_CHANNELS = 4
-    TRAP_TRAJ = 5
-    TORQUE_RAMP = 6
-    MIRROR = 7
-    TUNING = 8
-
-
-class ODriveCanSimple:
-    def __init__(self, axis_id=0, canbus="can0"):
-        self.id = axis_id
-        self.bus = can.interface.Bus(channel=canbus, bustype="socketcan")
-
-        # Scaling
-        self.gain_turnsPm = 1.0
-        self.offset_turns = 0.0
-        self.input_vel_scale = 1000
-        self.input_torque_scale = 1000
-
-        # Callback registry
-        self.callbacks = {}
-        self._stop_event = threading.Event()
-        self._listener_thread = threading.Thread(
-            target=self._listener_loop, daemon=True
+    def set_input_pos(self, pos_turns, vel_turns=0.0, torque=0.0):
+        payload = (
+            struct.pack("<f", pos_turns)
+            + int(vel_turns * 1000).to_bytes(2, "little", signed=True)
+            + int(torque * 1000).to_bytes(2, "little", signed=True)
         )
-        self._listener_thread.start()
+        self.manager._send(self.axis_id, 0x0C, payload)
 
-    # ----------------- Utility -----------------
-    def _send(self, arb_id, payload, rtr=False):
-        try:
-            msg = can.Message(
-                is_extended_id=False,
-                arbitration_id=arb_id,
-                data=payload,
-                is_remote_frame=rtr,
-            )
-            self.bus.send(msg)
-        except Exception as e:
-            print(f"[ODriveCanSimple] send error: {e}")
+    def set_input_vel(self, vel_turns, torque=0.0):
+        payload = struct.pack("<ff", vel_turns, torque)
+        self.manager._send(self.axis_id, 0x0D, payload)
+
+    def set_input_torque(self, torque):
+        payload = struct.pack("<f", torque)
+        self.manager._send(self.axis_id, 0x0E, payload)
+
+    def request_encoder_estimates(self):
+        self.manager._send(self.axis_id, 0x09, b"", rtr=True)
+
+    def request_bus_measurements(self):
+        self.manager._send(self.axis_id, 0x17, b"", rtr=True)
+
+    # ---------------- Callbacks ----------------
+    def on_encoder(self, cb):  # cb(pos, vel)
+        self.callbacks["encoder"] = cb
+
+    def on_bus(self, cb):  # cb(vbus, ibus)
+        self.callbacks["bus"] = cb
+
+    def on_iq(self, cb):  # cb(iq_set, iq_meas)
+        self.callbacks["iq"] = cb
+
+    # ---------------- Dispatch ----------------
+    def _handle_frame(self, cmd_id, data):
+        if cmd_id == 0x09 and self.callbacks["encoder"]:
+            pos, vel = struct.unpack("<ff", data)
+            self.callbacks["encoder"](pos, vel)
+        elif cmd_id == 0x14 and self.callbacks["iq"]:
+            iq_set, iq_meas = struct.unpack("<ff", data)
+            self.callbacks["iq"](iq_set, iq_meas)
+        elif cmd_id == 0x17 and self.callbacks["bus"]:
+            vbus, ibus = struct.unpack("<ff", data)
+            self.callbacks["bus"](vbus, ibus)
+
+
+class ODriveCanManager:
+    def __init__(self, canbus="can0"):
+        self.bus = can.interface.Bus(channel=canbus, bustype="socketcan")
+        self.axes = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._listener, daemon=True)
+        self._thread.start()
+
+    def add_axis(self, axis_id):
+        axis = ODriveAxis(axis_id, self)
+        self.axes[axis_id] = axis
+        return axis
 
     def close(self):
-        """Stop listener thread and close CAN bus."""
-        self._stop_event.set()
-        self._listener_thread.join(timeout=1.0)
+        self._stop.set()
+        self._thread.join(timeout=1.0)
         self.bus.shutdown()
 
-    # ----------------- Listener -----------------
-    def _listener_loop(self):
-        while not self._stop_event.is_set():
+    def _send(self, axis_id, cmd_id, payload, rtr=False):
+        arb_id = axis_id * 0x20 + cmd_id
+        msg = can.Message(
+            arbitration_id=arb_id,
+            data=payload,
+            is_extended_id=False,
+            is_remote_frame=rtr,
+        )
+        self.bus.send(msg)
+
+    def _listener(self):
+        while not self._stop.is_set():
             msg = self.bus.recv(timeout=0.1)
             if not msg:
                 continue
-
-            # Which command is this?
-            cmd_id = msg.arbitration_id - self.id * 0x20
-
-            # Dispatch callbacks
-            if cmd_id == 0x09 and "encoder" in self.callbacks:  # encoder estimates
-                try:
-                    pos, vel = self.decode_encoder_estimates(msg)
-                    self.callbacks["encoder"](pos, vel)
-                except Exception as e:
-                    print(f"[ODriveCanSimple] decode encoder error: {e}")
-
-            elif cmd_id == 0x14 and "iq" in self.callbacks:  # Iq feedback
-                try:
-                    iq_set, iq_meas = self.decode_iq(msg)
-                    self.callbacks["iq"](iq_set, iq_meas)
-                except Exception as e:
-                    print(f"[ODriveCanSimple] decode iq error: {e}")
-
-            elif cmd_id == 0x17 and "bus" in self.callbacks:  # bus voltage/current
-                try:
-                    vbus, ibus = self.decode_bus_measurements(msg)
-                    self.callbacks["bus"](vbus, ibus)
-                except Exception as e:
-                    print(f"[ODriveCanSimple] decode bus error: {e}")
-
-    def on_encoder(self, cb):
-        """Register callback: cb(pos, vel)"""
-        self.callbacks["encoder"] = cb
-
-    def on_bus(self, cb):
-        """Register callback: cb(vbus, ibus)"""
-        self.callbacks["bus"] = cb
-
-    def on_iq(self, cb):
-        """Register callback: cb(iq_set, iq_meas)"""
-        self.callbacks["iq"] = cb
-
-    # ----------------- Scaling -----------------
-    def set_calibrated_scale(self, gain_turnsPm, offset_m):
-        self.gain_turnsPm = gain_turnsPm
-        self.offset_turns = offset_m * gain_turnsPm
-
-    def set_ff_scale(self, input_vel_scale, input_torque_scale):
-        self.input_vel_scale = input_vel_scale
-        self.input_torque_scale = input_torque_scale
-
-    # ----------------- Commands -----------------
-    def set_axis_state(self, state: AxisState):
-        cmd_id = 0x07
-        arb_id = self.id * 0x20 + cmd_id
-        payload = int(state).to_bytes(4, "little")
-        self._send(arb_id, payload)
-
-    def set_input_pos(self, pos_m, vel_mPs=0, torque=0):
-        pos_turns = pos_m * self.gain_turnsPm + self.offset_turns
-        vel_turnsPs = vel_mPs * self.gain_turnsPm
-        cmd_id = 0x0C
-        arb_id = self.id * 0x20 + cmd_id
-        payload = (
-            bytearray(struct.pack("<f", pos_turns))
-            + int(vel_turnsPs * self.input_vel_scale).to_bytes(
-                2, "little", signed=True
-            )
-            + int(torque * self.input_torque_scale).to_bytes(2, "little", signed=True)
-        )
-        self._send(arb_id, payload)
-
-    def set_input_vel(self, vel_mPs, torque=0):
-        vel_turnsPs = vel_mPs * self.gain_turnsPm
-        cmd_id = 0x0D
-        arb_id = self.id * 0x20 + cmd_id
-        payload = bytearray(struct.pack("<f", vel_turnsPs)) + bytearray(
-            struct.pack("<f", torque)
-        )
-        self._send(arb_id, payload)
-
-    def set_input_torque(self, torque):
-        cmd_id = 0x0E
-        arb_id = self.id * 0x20 + cmd_id
-        payload = bytearray(struct.pack("<f", torque))
-        self._send(arb_id, payload)
-
-    def set_controller_mode(self, control_mode: ControlMode, input_mode: InputMode):
-        cmd_id = 0x0B
-        arb_id = self.id * 0x20 + cmd_id
-        payload = int(control_mode).to_bytes(4, "little") + int(input_mode).to_bytes(
-            4, "little"
-        )
-        self._send(arb_id, payload)
-
-    def set_abs_pos(self, pos_turns):
-        cmd_id = 0x19
-        arb_id = self.id * 0x20 + cmd_id
-        payload = bytearray(struct.pack("<f", pos_turns))
-        self._send(arb_id, payload)
-
-    # ----------------- Decoders -----------------
-    @staticmethod
-    def decode_encoder_estimates(msg):
-        pos, vel = struct.unpack("<ff", msg.data)
-        return pos, vel
-
-    @staticmethod
-    def decode_iq(msg):
-        iq_set, iq_meas = struct.unpack("<ff", msg.data)
-        return iq_set, iq_meas
-
-    @staticmethod
-    def decode_bus_measurements(msg):
-        vbus, ibus = struct.unpack("<ff", msg.data)
-        return vbus, ibus
+            axis_id = msg.arbitration_id // 0x20
+            cmd_id = msg.arbitration_id % 0x20
+            if axis_id in self.axes:
+                self.axes[axis_id]._handle_frame(cmd_id, msg.data)
