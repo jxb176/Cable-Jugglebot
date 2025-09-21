@@ -370,6 +370,13 @@ class ODriveCANBridge(threading.Thread):
 
         msg is a CanMsg object from odrive_can.
         """
+
+        # Debugging
+        if hasattr(msg, "data") and isinstance(msg.data, dict):
+            logger.debug(f"[ODRV] axis {axis_id} msg.data keys: {list(msg.data.keys())}")
+        if hasattr(msg, "signals"):
+            logger.debug(f"[ODRV] axis {axis_id} msg.signals keys: {list(msg.signals.keys())}")
+
         try:
             # Try to decode useful fields
             pos_val = None
