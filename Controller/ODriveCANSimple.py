@@ -14,7 +14,14 @@ class ODriveAxis:
     def __init__(self, axis_id, manager):
         self.axis_id = axis_id
         self.manager = manager
-        self.callbacks = {"encoder": None, "bus": None, "iq": None}
+        self.callbacks = {
+            "encoder": None,
+            "bus": None,
+            "iq": None,
+            "heartbeat": None,
+            "error": None,
+            "temp": None,
+        }
 
     # ---------------- Commands ----------------
     def set_axis_state(self, state: AxisState):
@@ -36,11 +43,25 @@ class ODriveAxis:
         payload = struct.pack("<f", torque)
         self.manager._send(self.axis_id, 0x0E, payload)
 
+    # ---------------- Requests ----------------
     def request_encoder_estimates(self):
         self.manager._send(self.axis_id, 0x09, b"", rtr=True)
 
     def request_bus_measurements(self):
         self.manager._send(self.axis_id, 0x17, b"", rtr=True)
+
+    def request_iq(self):
+        self.manager._send(self.axis_id, 0x14, b"", rtr=True)
+
+    def request_temp(self):
+        self.manager._send(self.axis_id, 0x18, b"", rtr=True)
+
+    def request_heartbeat(self):
+        self.manager._send(self.axis_id, 0x01, b"", rtr=True)
+
+    def request_error(self):
+        # errors come inside heartbeat, but allow explicit request
+        self.manager._send(self.axis_id, 0x01, b"", rtr=True)
 
     # ---------------- Callbacks ----------------
     def on_encoder(self, cb):  # cb(pos, vel)
@@ -52,17 +73,41 @@ class ODriveAxis:
     def on_iq(self, cb):  # cb(iq_set, iq_meas)
         self.callbacks["iq"] = cb
 
+    def on_heartbeat(self, cb):  # cb(axis_error, axis_state, ctrl_status)
+        self.callbacks["heartbeat"] = cb
+
+    def on_error(self, cb):  # cb(axis_error)
+        self.callbacks["error"] = cb
+
+    def on_temp(self, cb):  # cb(fet_temp, motor_temp)
+        self.callbacks["temp"] = cb
+
     # ---------------- Dispatch ----------------
     def _handle_frame(self, cmd_id, data):
-        if cmd_id == 0x09 and self.callbacks["encoder"]:
+        if cmd_id == 0x01:  # Heartbeat
+            axis_error = int.from_bytes(data[0:4], "little")
+            axis_state = data[4]
+            ctrl_status = data[5]
+            if self.callbacks["heartbeat"]:
+                self.callbacks["heartbeat"](axis_error, axis_state, ctrl_status)
+            if axis_error != 0 and self.callbacks["error"]:
+                self.callbacks["error"](axis_error)
+
+        elif cmd_id == 0x09 and self.callbacks["encoder"]:
             pos, vel = struct.unpack("<ff", data)
             self.callbacks["encoder"](pos, vel)
+
         elif cmd_id == 0x14 and self.callbacks["iq"]:
             iq_set, iq_meas = struct.unpack("<ff", data)
             self.callbacks["iq"](iq_set, iq_meas)
+
         elif cmd_id == 0x17 and self.callbacks["bus"]:
             vbus, ibus = struct.unpack("<ff", data)
             self.callbacks["bus"](vbus, ibus)
+
+        elif cmd_id == 0x18 and self.callbacks["temp"]:
+            fet_temp, motor_temp = struct.unpack("<ff", data)
+            self.callbacks["temp"](fet_temp, motor_temp)
 
 
 class ODriveCanManager:
