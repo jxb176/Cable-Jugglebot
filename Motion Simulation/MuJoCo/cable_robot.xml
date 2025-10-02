@@ -1,0 +1,71 @@
+<mujoco model="cable_robot">
+
+  <option timestep="0.001" gravity="0 0 -9.81"/>
+
+  <!-- Visualize world -->
+  <worldbody>
+    <geom type="plane" pos="0 0 0" size="5 5 0.1" rgba="0.8 0.8 0.8 1"/>
+
+    <!-- Anchors -->
+    <site name="a1" pos=" 0.5  0.5  1.0"/>
+    <site name="a2" pos=" 0.5 -0.5  1.0"/>
+    <site name="a3" pos="-0.5  0.5  1.0"/>
+    <site name="a4" pos="-0.5 -0.5  1.0"/>
+    <site name="a5" pos=" 0.5  0.5  0.0"/>
+    <site name="a6" pos="-0.5 -0.5  0.0"/>
+
+    <!-- Moving platform -->
+    <body name="platform" pos="0 0 0.5">
+      <freejoint/>
+      <geom type="box" size="0.05 0.05 0.01" rgba="0.2 0.6 0.9 1"/>
+
+      <!-- Cable attachment points on platform -->
+      <site name="p1" pos=" 0.05  0.05 0"/>
+      <site name="p2" pos=" 0.05 -0.05 0"/>
+      <site name="p3" pos="-0.05  0.05 0"/>
+      <site name="p4" pos="-0.05 -0.05 0"/>
+      <site name="p5" pos=" 0.05  0.05 0"/>
+      <site name="p6" pos="-0.05 -0.05 0"/>
+    </body>
+  </worldbody>
+
+  <!-- Tendons: anchors to platform sites -->
+  <tendon>
+    <spatial name="cable1" stiffness="500" damping="1" springlength="0.7">
+      <site site="a1"/>
+      <site site="p1"/>
+    </spatial>
+    <spatial name="cable2" stiffness="500" damping="1" springlength="0.7">
+      <site site="a2"/>
+      <site site="p2"/>
+    </spatial>
+    <spatial name="cable3" stiffness="500" damping="1" springlength="0.7">
+      <site site="a3"/>
+      <site site="p3"/>
+    </spatial>
+    <spatial name="cable4" stiffness="500" damping="1" springlength="0.7">
+      <site site="a4"/>
+      <site site="p4"/>
+    </spatial>
+    <spatial name="cable5" stiffness="500" damping="1" springlength="0.7">
+      <site site="a5"/>
+      <site site="p5"/>
+    </spatial>
+    <spatial name="cable6" stiffness="500" damping="1" springlength="0.7">
+      <site site="a6"/>
+      <site site="p6"/>
+    </spatial>
+  </tendon>
+
+  <!-- Actuators: pull on each tendon -->
+<actuator>
+  <position name="m1" tendon="cable1" kp="500"/>
+  <position name="m2" tendon="cable2" kp="500"/>
+  <position name="m3" tendon="cable3" kp="500"/>
+  <position name="m4" tendon="cable4" kp="500"/>
+  <position name="m5" tendon="cable5" kp="500"/>
+  <position name="m6" tendon="cable6" kp="500"/>
+</actuator>
+
+
+</mujoco>
