@@ -230,7 +230,7 @@ class RobotGUI(QWidget):
         self.busv_curve = self.busv_plot.plot(pen='c')
         layout.addWidget(self.busv_plot)
 
-        # Bus Current label + plot   <-- add
+        # Bus Current label + plot
         self.busi_label = QLabel("Bus Current (A1): -- A")
         layout.addWidget(self.busi_label)
 
@@ -241,6 +241,27 @@ class RobotGUI(QWidget):
         self.busi_curve = self.busi_plot.plot(pen='m')
         layout.addWidget(self.busi_plot)
 
+        # Temperature feedback
+        self.tempfet_label = QLabel("FET Temp (A1): -- °C")
+        layout.addWidget(self.tempfet_label)
+
+        self.tempfet_plot = pg.PlotWidget(title="FET Temperature (°C)")
+        self.tempfet_plot.setLabel('bottom', 'Time', 's')
+        self.tempfet_plot.setLabel('left', 'Temp', '°C')
+        self.tempfet_plot.showGrid(x=True, y=True)
+        self.tempfet_curve = self.tempfet_plot.plot(pen='r')
+        layout.addWidget(self.tempfet_plot)
+
+        self.tempmotor_label = QLabel("Motor Temp (A1): -- °C")
+        layout.addWidget(self.tempmotor_label)
+
+        self.tempmotor_plot = pg.PlotWidget(title="Motor Temperature (°C)")
+        self.tempmotor_plot.setLabel('bottom', 'Time', 's')
+        self.tempmotor_plot.setLabel('left', 'Temp', '°C')
+        self.tempmotor_plot.showGrid(x=True, y=True)
+        self.tempmotor_curve = self.tempmotor_plot.plot(pen='g')
+        layout.addWidget(self.tempmotor_plot)
+
         self.setLayout(layout)
 
         # Data buffers
@@ -250,6 +271,8 @@ class RobotGUI(QWidget):
         self.vbus_x = []  # bus voltage time axis
         self.vbus_y = []  # bus voltage values
         self.busi_x, self.busi_y = [], []
+        self.tempfet_x, self.tempfet_y = [], []
+        self.tempmotor_x, self.tempmotor_y = [], []
 
         self.start_time = time.time()
         self.last_pos = [0.0]*6
@@ -412,6 +435,26 @@ class RobotGUI(QWidget):
                             if len(self.busi_x) > 200:
                                 self.busi_x = self.busi_x[-200:]
                                 self.busi_y = self.busi_y[-200:]
+                # Temperatures (arrays)
+                if "temp_fet" in telem:
+                    tf = telem.get("temp_fet", [])
+                    if isinstance(tf, list) and len(tf) >= 1 and tf[0] is not None:
+                        self.tempfet_label.setText(f"FET Temp (A1): {float(tf[0]):.1f} °C")
+                        self.tempfet_x.append(t - self.start_time)
+                        self.tempfet_y.append(float(tf[0]))
+                        if len(self.tempfet_x) > 200:
+                            self.tempfet_x = self.tempfet_x[-200:]
+                            self.tempfet_y = self.tempfet_y[-200:]
+
+                if "temp_motor" in telem:
+                    tm = telem.get("temp_motor", [])
+                    if isinstance(tm, list) and len(tm) >= 1 and tm[0] is not None:
+                        self.tempmotor_label.setText(f"Motor Temp (A1): {float(tm[0]):.1f} °C")
+                        self.tempmotor_x.append(t - self.start_time)
+                        self.tempmotor_y.append(float(tm[0]))
+                        if len(self.tempmotor_x) > 200:
+                            self.tempmotor_x = self.tempmotor_x[-200:]
+                            self.tempmotor_y = self.tempmotor_y[-200:]
             elif isinstance(telem, (tuple, list)) and len(telem) >= 2:
                 try:
                     t = float(telem[0])
@@ -429,6 +472,8 @@ class RobotGUI(QWidget):
         self.curve_vel.setData(self.xdata, self.ydata_vel)
         self.busv_curve.setData(self.vbus_x, self.vbus_y)
         self.busi_curve.setData(self.busi_x, self.busi_y)
+        self.tempfet_curve.setData(self.tempfet_x, self.tempfet_y)
+        self.tempmotor_curve.setData(self.tempmotor_x, self.tempmotor_y)
 
 # --- Simulated Robot ---  # (not used when connected to real robot)
 # def robot_sim(cmd_queue, telem_queue):
