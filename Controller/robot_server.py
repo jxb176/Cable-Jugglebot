@@ -392,7 +392,6 @@ class ODriveCANBridge(threading.Thread):
                     self.state.set_axis_feedback(i, bus_voltage=vbus, bus_current=ibus))
 
                 # temperatures callback, if your ODriveCANSimple exposes it
-                if hasattr(axis, "on_temp"):
                 axis.on_temp(lambda fet, motor, i=aid:
                     self.state.set_axis_feedback(i, temp_fet=fet, temp_motor=motor))
 
