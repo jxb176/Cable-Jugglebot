@@ -105,7 +105,7 @@ class ODriveAxis:
             vbus, ibus = struct.unpack("<ff", data)
             self.callbacks["bus"](vbus, ibus)
 
-        elif cmd_id == 0x18 and self.callbacks["temp"]:
+        elif cmd_id == 0x15 and self.callbacks["temp"]:
             fet_temp, motor_temp = struct.unpack("<ff", data)
             self.callbacks["temp"](fet_temp, motor_temp)
 
