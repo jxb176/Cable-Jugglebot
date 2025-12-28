@@ -167,6 +167,36 @@ class RobotGUI(QWidget):
             self.axis_spins.append(spin)
         layout.addLayout(axes_layout)
 
+        # ---- Home position inputs + button ----
+        home_layout = QVBoxLayout()
+
+        home_layout.addWidget(QLabel("Home Position (Turns)"))
+
+        self.home_spins = []
+        row = QHBoxLayout()
+        for i in range(6):
+            col = QVBoxLayout()
+            col.addWidget(QLabel(f"A{i+1}"))
+            spin = QDoubleSpinBox()
+            spin.setDecimals(4)
+            spin.setRange(-100.0, 100.0)
+            spin.setSingleStep(0.01)
+            spin.setValue(0.0)  # <-- set your defaults here if you want
+            col.addWidget(spin)
+            row.addLayout(col)
+            self.home_spins.append(spin)
+        home_layout.addLayout(row)
+
+        btn_row = QHBoxLayout()
+        self.btn_home = QPushButton("HOME")
+        self.btn_home.clicked.connect(self.send_home)
+        btn_row.addWidget(self.btn_home)
+        btn_row.addStretch(1)
+        home_layout.addLayout(btn_row)
+
+        layout.addLayout(home_layout)
+
+
         # State controls
         state_layout = QHBoxLayout()
         self.btn_enable = QPushButton("Enable")
@@ -367,6 +397,12 @@ class RobotGUI(QWidget):
     def send_state(self, state_value: str):
         cmd = {"type": "state", "value": state_value}
         _queue_put_latest(self.cmd_queue, cmd)
+
+    def send_home(self):
+        positions = [float(sp.value()) for sp in self.home_spins]
+        cmd = {"type": "home", "positions": positions, "units": "turns"}
+        _queue_put_latest(self.cmd_queue, cmd)
+        self.status_label.setText("HOME command sent")
 
     def _load_csv_as_profile(self, path: str):
         rows = []

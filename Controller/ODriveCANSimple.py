@@ -43,6 +43,10 @@ class ODriveAxis:
         payload = struct.pack("<f", torque)
         self.manager._send(self.axis_id, 0x0E, payload)
 
+    def set_absolute_position(self, pos_turns: float):
+        payload = struct.pack("<f", float(pos_turns))  # float32, little-endian
+        self.manager._send(self.axis_id, 0x19, payload, rtr=False)
+
     # ---------------- Requests ----------------
     def request_encoder_estimates(self):
         self.manager._send(self.axis_id, 0x09, b"", rtr=True)

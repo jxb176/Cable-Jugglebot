@@ -108,6 +108,8 @@ class RobotState:
         self.axes_pos_cmd = [0.0] * 6
         self.state = "disable"
         self.state_version = 0
+        self.home_pos = [0.0] * 6
+        self.home_version = 0
         self.profile = []
         self.player_thread = None
         self.axes_pos_estimate = [None] * 6
@@ -144,6 +146,24 @@ class RobotState:
         with self.lock:
             return list(self.axes_vel_estimate)
 
+    #Home methods
+    def request_home(self, home_pos):
+        if not isinstance(home_pos, (list, tuple)) or len(home_pos) != 6:
+            raise ValueError("home_pos must be length-6 list/tuple")
+        with self.lock:
+            self.home_pos = [float(x) for x in home_pos]
+            self.home_version += 1
+        logger.info("HOME requested: " + ", ".join(f"{x:.4f}" for x in self.home_pos))
+
+    def get_home_version(self):
+        with self.lock:
+            return self.home_version
+
+    def get_home_pos(self):
+        with self.lock:
+            return list(self.home_pos)
+
+    #Set methods
     def set_axis_feedback(
             self,
             axis_id: int,
@@ -408,6 +428,7 @@ class ODriveCANBridge(threading.Thread):
         self.manager = None
         self._stop = threading.Event()
         self._applied_state_version = -1  # track changes
+        self._applied_home_version = -1
 
     def stop(self):
         self._stop.set()
@@ -460,6 +481,12 @@ class ODriveCANBridge(threading.Thread):
                     self._apply_state(st)
                     self._applied_state_version = sv
 
+                # Apply HOME request (one-shot) when version changes
+                hv = self.state.get_home_version()
+                if hv != self._applied_home_version:
+                    self._apply_home()
+                    self._applied_home_version = hv
+
                 # Stream setpoints if enabled
                 if st == "enable":
                     pos_cmd = self.state.get_pos_cmd()
@@ -504,6 +531,37 @@ class ODriveCANBridge(threading.Thread):
                     axis.set_axis_state(AxisState.IDLE)
         except Exception as e:
             logger.error(f"[ODRV] _apply_state error: {e}")
+
+    def _apply_home(self):
+        """
+        HOME intent: do NOT move motors.
+        We reset the estimator's absolute position (pos_estimate) to the GUI-provided
+        home positions, and also align the streamed setpoints to those same values
+        so the controller doesn't step.
+        """
+        if not self.manager:
+            return
+
+        home_pos = self.state.get_home_pos()
+
+        # 1) Update command setpoints first (prevents any mismatch on next stream tick)
+        try:
+            self.state.set_axes(home_pos)
+        except Exception as e:
+            logger.error(f"[HOME] Failed to set_axes(home_pos): {e}")
+
+        # 2) Send Set_Absolute_Position to each axis
+        for i, aid in enumerate(self.axis_ids):
+            axis = self.manager.axes.get(aid)
+            if not axis:
+                continue
+            try:
+                axis.set_absolute_position(home_pos[i])
+                # optional: also set input_pos immediately once, to match setpoint now
+                axis.set_input_pos(home_pos[i])
+                logger.info(f"[HOME] axis {aid}: abs_pos <- {home_pos[i]:.4f} turns")
+            except Exception as e:
+                logger.warning(f"[HOME] axis {aid} set_absolute_position failed: {e}")
 
 
 
@@ -604,6 +662,8 @@ def tcp_command_server(state: RobotState):
                             state.set_axes(msg.get("positions", []))
                         elif mtype == "state":
                             state.set_state(msg.get("value", "disable"))
+                        elif mtype == "home":
+                            state.request_home(msg.get("home_pos", []))
                         elif mtype == "profile_upload":
                             profile = msg.get("profile", [])
                             state.set_profile(profile)
