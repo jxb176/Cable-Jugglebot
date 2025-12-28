@@ -42,6 +42,8 @@ class CommandClient(threading.Thread):
         self.status_cb = status_cb
         self._stop = threading.Event()
         self._sock = None
+        # History length (number of samples kept in plots)
+        self.history_seconds = 20.0
 
     def run(self):
         last_cmd = None
@@ -406,17 +408,29 @@ class RobotGUI(QWidget):
                     buf_list[i].append(float("nan"))
 
     def _trim_history(self):
-        n = self.history_len
-        if len(self.tbuf) <= n:
+        if not self.tbuf:
             return
-        self.tbuf = self.tbuf[-n:]
+        t_latest = self.tbuf[-1]
+        t_min = t_latest - self.history_seconds
+
+        # find first index to keep
+        k0 = 0
+        for k in range(len(self.tbuf)):
+            if self.tbuf[k] >= t_min:
+                k0 = k
+                break
+
+        if k0 <= 0:
+            return
+
+        self.tbuf = self.tbuf[k0:]
         for banks in (
                 self.pos_buf, self.vel_buf,
                 self.temp_motor_buf, self.temp_fet_buf,
                 self.cur_motor_buf, self.cur_bus_buf,
         ):
             for i in range(6):
-                banks[i] = banks[i][-n:]
+                banks[i] = banks[i][k0:]
 
     def update_gui(self):
         updated = False
