@@ -279,26 +279,16 @@ class RobotGUI(QWidget):
             )
         layout.addWidget(self.plot_temp)
 
-        # Temperature Labels
-        self.tempfet_label = QLabel("FET Temp (A1): -- °C")
-        layout.addWidget(self.tempfet_label)
-        self.tempmotor_label = QLabel("Motor Temp (A1): -- °C")
-        layout.addWidget(self.tempmotor_label)
-
-        # Bus Voltage label + plot
-        self.busv_label = QLabel("Bus Voltage (A1): -- V")
-        layout.addWidget(self.busv_label)
-
+        # Bus Voltage plot
         self.busv_plot = pg.PlotWidget(title="Bus Voltage (V)")
         self.busv_plot.setLabel('bottom', 'Time', 's')
         self.busv_plot.setLabel('left', 'Voltage', 'V')
         self.busv_plot.showGrid(x=True, y=True)
-        self.busv_curve = self.busv_plot.plot(pen='c')
+        self.busv_plot.addLegend()
+        self.curves_busv = []
+        for i in range(6):
+            self.curves_busv.append(self.busv_plot.plot(name=f"A{i + 1}", pen=axis_pen(i, width=2)))
         layout.addWidget(self.busv_plot)
-
-        # Bus Current label + plot
-        self.busi_label = QLabel("Bus Current (A1): -- A")
-        layout.addWidget(self.busi_label)
 
         # Current plot (12 traces: motor current + bus current for each axis)
         self.plot_cur = pg.PlotWidget(title="Currents (A) — Motor + Bus (A1..A6)")
@@ -333,6 +323,10 @@ class RobotGUI(QWidget):
 
         self.temp_motor_buf = [[] for _ in range(6)]
         self.temp_fet_buf = [[] for _ in range(6)]
+
+        # --- Heartbeat / state / error buffers (ints) ---
+        self.axis_state_buf = [[] for _ in range(6)]
+        self.axis_error_buf = [[] for _ in range(6)]
 
         self.start_time = time.time()
         self.last_pos = [0.0]*6
@@ -488,7 +482,8 @@ class RobotGUI(QWidget):
             for i in range(6):
                 banks[i] = banks[i][k0:]
 
-    def _set_table_cell(self, row: int, col: int, value, fmt: str | None = None):
+    def _set_table_cell(self, row: int, col: int, value, fmt=None):
+
         """
         value can be float/int/None/NaN/str. If fmt is provided, it's used for numeric formatting.
         """
@@ -577,13 +572,13 @@ class RobotGUI(QWidget):
             # Cols: State, Error, Pos, Vel, MotorI, BusV, BusI, TempMotor, TempFET
             self._set_table_cell(i, 0, state_i, None)
             self._set_table_cell(i, 1, error_i, None)
-            self._set_table_cell(i, 0, pos_i, "{:.4f}")
-            self._set_table_cell(i, 1, vel_i, "{:.4f}")
-            self._set_table_cell(i, 2, motor_i, "{:.2f}")
-            self._set_table_cell(i, 3, busv_i, "{:.2f}")
-            self._set_table_cell(i, 4, bus_i, "{:.2f}")
-            self._set_table_cell(i, 5, tm_i, "{:.1f}")
-            self._set_table_cell(i, 6, tf_i, "{:.1f}")
+            self._set_table_cell(i, 2, pos_i, "{:.4f}")
+            self._set_table_cell(i, 3, vel_i, "{:.4f}")
+            self._set_table_cell(i, 4, motor_i, "{:.2f}")
+            self._set_table_cell(i, 5, busv_i, "{:.2f}")
+            self._set_table_cell(i, 6, bus_i, "{:.2f}")
+            self._set_table_cell(i, 7, tm_i, "{:.1f}")
+            self._set_table_cell(i, 8, tf_i, "{:.1f}")
 
         # update plots
         x = self.tbuf
@@ -596,6 +591,8 @@ class RobotGUI(QWidget):
 
             self.curves_cur_bus[i].setData(x, self.cur_bus_buf[i])
             self.curves_cur_motor[i].setData(x, self.cur_motor_buf[i])
+
+            self.curves_busv[i].setData(x, self.bus_v_buf[i])
 
 # --- Simulated Robot ---  # (not used when connected to real robot)
 # def robot_sim(cmd_queue, telem_queue):
