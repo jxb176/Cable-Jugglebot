@@ -42,8 +42,6 @@ class CommandClient(threading.Thread):
         self.status_cb = status_cb
         self._stop = threading.Event()
         self._sock = None
-        # History length (number of samples kept in plots)
-        self.history_seconds = 20.0
 
     def run(self):
         last_cmd = None
@@ -125,6 +123,9 @@ class RobotGUI(QWidget):
 
         self.cmd_queue = cmd_queue
         self.telem_queue = telem_queue
+
+        # History length (number of samples kept in plots)
+        self.history_seconds = 20.0
 
         # --- Layout ---
         layout = QVBoxLayout()
