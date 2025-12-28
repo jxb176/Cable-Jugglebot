@@ -400,7 +400,7 @@ class RobotGUI(QWidget):
 
     def send_home(self):
         positions = [float(sp.value()) for sp in self.home_spins]
-        cmd = {"type": "home", "positions": positions, "units": "turns"}
+        cmd = {"type": "home", "home_pos": positions, "units": "turns"}
         _queue_put_latest(self.cmd_queue, cmd)
         self.status_label.setText("HOME command sent")
 
