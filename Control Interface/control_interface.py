@@ -203,21 +203,48 @@ class RobotGUI(QWidget):
         layout.addLayout(prof_layout)
 
         # --- Telemetry plots ---
-        # Position plot
-        self.plot_pos = pg.PlotWidget(title="Axis 1 Position (turns)")
-        self.plot_pos.setLabel('bottom', 'Time', 's')
-        self.plot_pos.setLabel('left', 'Position', 'turns')
+        # Position plot (6 traces)
+        self.plot_pos = pg.PlotWidget(title="Position (turns) — A1..A6")
+        self.plot_pos.setLabel("bottom", "Time", "s")
+        self.plot_pos.setLabel("left", "Position", "turns")
         self.plot_pos.showGrid(x=True, y=True)
-        self.curve_pos = self.plot_pos.plot(pen='y')
+        self.plot_pos.addLegend()
+        self.curves_pos = []
+        for i in range(6):
+            c = self.plot_pos.plot(name=f"A{i + 1}")
+            self.curves_pos.append(c)
         layout.addWidget(self.plot_pos)
 
-        # Velocity plot
-        self.plot_vel = pg.PlotWidget(title="Axis 1 Velocity (turns/s)")
-        self.plot_vel.setLabel('bottom', 'Time', 's')
-        self.plot_vel.setLabel('left', 'Velocity', 'turns/s')
+        # Velocity plot (6 traces)
+        self.plot_vel = pg.PlotWidget(title="Velocity (turns/s) — A1..A6")
+        self.plot_vel.setLabel("bottom", "Time", "s")
+        self.plot_vel.setLabel("left", "Velocity", "turns/s")
         self.plot_vel.showGrid(x=True, y=True)
-        self.curve_vel = self.plot_vel.plot(pen='c')
+        self.plot_vel.addLegend()
+        self.curves_vel = []
+        for i in range(6):
+            c = self.plot_vel.plot(name=f"A{i + 1}")
+            self.curves_vel.append(c)
         layout.addWidget(self.plot_vel)
+
+        # Temperature plot (12 traces: motor+fet for each axis)
+        self.plot_temp = pg.PlotWidget(title="Temperatures (°C) — Motor + FET (A1..A6)")
+        self.plot_temp.setLabel("bottom", "Time", "s")
+        self.plot_temp.setLabel("left", "Temp", "°C")
+        self.plot_temp.showGrid(x=True, y=True)
+        self.plot_temp.addLegend()
+        self.curves_temp_motor = []
+        self.curves_temp_fet = []
+        for i in range(6):
+            self.curves_temp_motor.append(self.plot_temp.plot(name=f"A{i + 1} Motor"))
+            self.curves_temp_fet.append(self.plot_temp.plot(name=f"A{i + 1} FET"))
+        layout.addWidget(self.plot_temp)
+
+        # Temperature Labels
+        self.tempfet_label = QLabel("FET Temp (A1): -- °C")
+        layout.addWidget(self.tempfet_label)
+        self.tempmotor_label = QLabel("Motor Temp (A1): -- °C")
+        layout.addWidget(self.tempmotor_label)
 
         # Bus Voltage label + plot
         self.busv_label = QLabel("Bus Voltage (A1): -- V")
@@ -234,45 +261,36 @@ class RobotGUI(QWidget):
         self.busi_label = QLabel("Bus Current (A1): -- A")
         layout.addWidget(self.busi_label)
 
-        self.busi_plot = pg.PlotWidget(title="Bus Current (A)")
-        self.busi_plot.setLabel('bottom', 'Time', 's')
-        self.busi_plot.setLabel('left', 'Current', 'A')
-        self.busi_plot.showGrid(x=True, y=True)
-        self.busi_curve = self.busi_plot.plot(pen='m')
-        layout.addWidget(self.busi_plot)
+        # Current plot (12 traces: motor current + bus current for each axis)
+        self.plot_cur = pg.PlotWidget(title="Currents (A) — Motor + Bus (A1..A6)")
+        self.plot_cur.setLabel("bottom", "Time", "s")
+        self.plot_cur.setLabel("left", "Current", "A")
+        self.plot_cur.showGrid(x=True, y=True)
+        self.plot_cur.addLegend()
+        self.curves_cur_motor = []
+        self.curves_cur_bus = []
+        for i in range(6):
+            self.curves_cur_motor.append(self.plot_cur.plot(name=f"A{i + 1} Motor I"))
+            self.curves_cur_bus.append(self.plot_cur.plot(name=f"A{i + 1} Bus I"))
+        layout.addWidget(self.plot_cur)
 
-        # Temperature feedback
-        self.tempfet_label = QLabel("FET Temp (A1): -- °C")
-        layout.addWidget(self.tempfet_label)
-
-        self.tempfet_plot = pg.PlotWidget(title="FET Temperature (°C)")
-        self.tempfet_plot.setLabel('bottom', 'Time', 's')
-        self.tempfet_plot.setLabel('left', 'Temp', '°C')
-        self.tempfet_plot.showGrid(x=True, y=True)
-        self.tempfet_curve = self.tempfet_plot.plot(pen='r')
-        layout.addWidget(self.tempfet_plot)
-
-        self.tempmotor_label = QLabel("Motor Temp (A1): -- °C")
-        layout.addWidget(self.tempmotor_label)
-
-        self.tempmotor_plot = pg.PlotWidget(title="Motor Temperature (°C)")
-        self.tempmotor_plot.setLabel('bottom', 'Time', 's')
-        self.tempmotor_plot.setLabel('left', 'Temp', '°C')
-        self.tempmotor_plot.showGrid(x=True, y=True)
-        self.tempmotor_curve = self.tempmotor_plot.plot(pen='g')
-        layout.addWidget(self.tempmotor_plot)
 
         self.setLayout(layout)
 
         # Data buffers
-        self.xdata = []
-        self.ydata = []       # position data
-        self.ydata_vel = []   # velocity data
+        self.tbuf = []
+
+        self.pos_buf = [[] for _ in range(6)]
+        self.vel_buf = [[] for _ in range(6)]
+
         self.vbus_x = []  # bus voltage time axis
         self.vbus_y = []  # bus voltage values
-        self.busi_x, self.busi_y = [], []
-        self.tempfet_x, self.tempfet_y = [], []
-        self.tempmotor_x, self.tempmotor_y = [], []
+
+        self.cur_motor_buf = [[] for _ in range(6)]
+        self.cur_bus_buf = [[] for _ in range(6)]
+
+        self.temp_motor_buf = [[] for _ in range(6)]
+        self.temp_fet_buf = [[] for _ in range(6)]
 
         self.start_time = time.time()
         self.last_pos = [0.0]*6
@@ -373,6 +391,89 @@ class RobotGUI(QWidget):
         _queue_put_latest(self.cmd_queue, cmd)
         self.status_label.setText(f"Profile start requested at {rate:.1f} Hz")
 
+    def _append_vec6(self, buf_list, vec):
+        """Append a length-6 vector to per-axis buffers. Missing/None -> NaN."""
+        if not isinstance(vec, list):
+            vec = []
+        for i in range(6):
+            v = vec[i] if i < len(vec) else None
+            if v is None:
+                buf_list[i].append(float("nan"))
+            else:
+                try:
+                    buf_list[i].append(float(v))
+                except Exception:
+                    buf_list[i].append(float("nan"))
+
+    def _trim_history(self):
+        n = self.history_len
+        if len(self.tbuf) <= n:
+            return
+        self.tbuf = self.tbuf[-n:]
+        for banks in (
+                self.pos_buf, self.vel_buf,
+                self.temp_motor_buf, self.temp_fet_buf,
+                self.cur_motor_buf, self.cur_bus_buf,
+        ):
+            for i in range(6):
+                banks[i] = banks[i][-n:]
+
+    def update_gui(self):
+        updated = False
+
+        while not self.telem_queue.empty():
+            telem = self.telem_queue.get()
+            if not isinstance(telem, dict):
+                continue
+
+            self.last_telem_time = time.time()
+            t = float(telem.get("t", time.time()))
+            trel = t - self.start_time
+
+            # timebase
+            self.tbuf.append(trel)
+
+            # required arrays
+            self._append_vec6(self.pos_buf, telem.get("pos", []))
+            self._append_vec6(self.vel_buf, telem.get("vel", []))
+
+            # temps (match your keys)
+            self._append_vec6(self.temp_fet_buf, telem.get("temp_fet", []))
+            self._append_vec6(self.temp_motor_buf, telem.get("temp_motor", []))
+
+            # currents
+            self._append_vec6(self.cur_bus_buf, telem.get("bus_i", []))
+            # motor current is optional; will plot NaNs until you send it
+            self._append_vec6(self.cur_motor_buf, telem.get("motor_i", []))
+
+            self._trim_history()
+            updated = True
+
+            # update the numeric pos/vel labels using the newest samples
+            for i in range(6):
+                p = self.pos_buf[i][-1] if self.pos_buf[i] else float("nan")
+                v = self.vel_buf[i][-1] if self.vel_buf[i] else float("nan")
+                p_text = "---" if (p != p) else f"{p:.4f}"
+                v_text = "---" if (v != v) else f"{v:.4f}"
+                self.fb_labels[i][0].setText(p_text)
+                self.fb_labels[i][1].setText(v_text)
+
+        if not updated:
+            return
+
+        # update plots
+        x = self.tbuf
+        for i in range(6):
+            self.curves_pos[i].setData(x, self.pos_buf[i])
+            self.curves_vel[i].setData(x, self.vel_buf[i])
+
+            self.curves_temp_motor[i].setData(x, self.temp_motor_buf[i])
+            self.curves_temp_fet[i].setData(x, self.temp_fet_buf[i])
+
+            self.curves_cur_bus[i].setData(x, self.cur_bus_buf[i])
+            self.curves_cur_motor[i].setData(x, self.cur_motor_buf[i])
+
+    """             
     def update_gui(self):
         while not self.telem_queue.empty():
             telem = self.telem_queue.get()
@@ -474,6 +575,7 @@ class RobotGUI(QWidget):
         self.busi_curve.setData(self.busi_x, self.busi_y)
         self.tempfet_curve.setData(self.tempfet_x, self.tempfet_y)
         self.tempmotor_curve.setData(self.tempmotor_x, self.tempmotor_y)
+    """
 
 # --- Simulated Robot ---  # (not used when connected to real robot)
 # def robot_sim(cmd_queue, telem_queue):

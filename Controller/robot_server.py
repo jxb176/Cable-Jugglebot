@@ -503,6 +503,7 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
                 fb_vel = state.get_vel_fbk()
                 bus_v = state.get_bus_voltage() or []
                 bus_i = state.get_bus_current() or []
+                motor_i = state.get_motor_current() or []
                 temp_fet = state.get_temp_fet() or []
                 temp_motor = state.get_temp_motor() or []
                 msg = {
@@ -511,6 +512,7 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
                     "vel": [None if v is None else float(v) for v in fb_vel],
                     "bus_v": [None if v is None else float(v) for v in bus_v],
                     "bus_i": [None if i is None else float(i) for i in bus_i],
+                    "motor_i": [None if x is None else float(x) for x in motor_i],
                     "temp_fet": [None if x is None else float(x) for x in temp_fet],
                     "temp_motor": [None if x is None else float(x) for x in temp_motor],
                 }
