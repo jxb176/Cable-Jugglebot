@@ -521,6 +521,8 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
                 motor_i = state.get_motor_current() or []
                 temp_fet = state.get_temp_fet() or []
                 temp_motor = state.get_temp_motor() or []
+                axis_state = state.get_axis_state() or []
+                axis_error = state.get_axis_error() or []
                 msg = {
                     "t": time.time(),
                     "pos": [None if v is None else float(v) for v in fb_pos],
@@ -530,6 +532,8 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
                     "motor_i": [None if x is None else float(x) for x in motor_i],
                     "temp_fet": [None if x is None else float(x) for x in temp_fet],
                     "temp_motor": [None if x is None else float(x) for x in temp_motor],
+                    "axis_state": [None if x is None else int(x) for x in axis_state],
+                    "axis_error": [None if x is None else int(x) for x in axis_error],
                 }
                 udp_sock.sendto(json.dumps(msg).encode("utf-8"), controller_addr)
         except Exception as e:

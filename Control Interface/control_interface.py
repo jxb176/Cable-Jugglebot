@@ -11,7 +11,8 @@ import csv
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
-    QLabel, QSlider, QHBoxLayout, QDoubleSpinBox, QComboBox
+    QLabel, QSlider, QHBoxLayout, QDoubleSpinBox, QComboBox,
+    QTableWidget, QTableWidgetItem, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QTimer
 
@@ -124,6 +125,20 @@ class RobotGUI(QWidget):
         self.cmd_queue = cmd_queue
         self.telem_queue = telem_queue
 
+        # ---- Consistent per-axis color coding (A1..A6) ----
+        # Use a fixed palette so colors stay consistent across plots
+        self.axis_colors = [
+            (255, 80, 80),  # A1 - red
+            (80, 200, 120),  # A2 - green
+            (80, 160, 255),  # A3 - blue
+            (255, 200, 80),  # A4 - amber
+            (190, 120, 255),  # A5 - purple
+            (80, 220, 220),  # A6 - cyan
+        ]
+
+        def axis_pen(i: int, width: int = 2, style=Qt.PenStyle.SolidLine):
+            return pg.mkPen(color=self.axis_colors[i], width=width, style=style)
+
         # History length (number of samples kept in plots)
         self.history_seconds = 20.0
 
@@ -165,23 +180,6 @@ class RobotGUI(QWidget):
         state_layout.addWidget(self.btn_estop)
         layout.addLayout(state_layout)
 
-        # Live feedback (pos/vel) labels
-        fb_layout = QVBoxLayout()
-        self.fb_labels = []
-        for i in range(6):
-            row = QHBoxLayout()
-            lbl = QLabel(f"A{i+1} pos:")
-            val_pos = QLabel("--")
-            lbl2 = QLabel("vel:")
-            val_vel = QLabel("--")
-            row.addWidget(lbl)
-            row.addWidget(val_pos)
-            row.addWidget(lbl2)
-            row.addWidget(val_vel)
-            fb_layout.addLayout(row)
-            self.fb_labels.append((val_pos, val_vel))
-        layout.addLayout(fb_layout)
-
         # Profile controls
         prof_layout = QHBoxLayout()
         self.profile_combo = QComboBox()
@@ -205,6 +203,40 @@ class RobotGUI(QWidget):
         prof_layout.addWidget(self.profile_start_btn)
         layout.addLayout(prof_layout)
 
+        # ---- Axis numeric matrix (6 rows x columns) ----
+        self.axis_table_cols = [
+            "State",
+            "Error",
+            "Pos (turns)",
+            "Vel (turns/s)",
+            "Motor I (A)",
+            "Bus V (V)",
+            "Bus I (A)",
+            "Temp Motor (°C)",
+            "Temp FET (°C)",
+        ]
+
+        self.axis_table = QTableWidget(6, len(self.axis_table_cols))
+        self.axis_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        # Make the table tall enough to show all 6 rows + header
+        row_h = self.axis_table.verticalHeader().defaultSectionSize()
+        hdr_h = self.axis_table.horizontalHeader().height()
+        frame = 2 * self.axis_table.frameWidth()
+        self.axis_table.setMinimumHeight(hdr_h + 6 * row_h + frame + 8)
+
+        self.axis_table.setHorizontalHeaderLabels(self.axis_table_cols)
+        self.axis_table.setVerticalHeaderLabels([f"A{i+1}" for i in range(6)])
+        self.axis_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.axis_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+
+        # optional: nicer sizing
+        #self.axis_table.horizontalHeader().setStretchLastSection(True)
+        self.axis_table.resizeColumnsToContents()
+
+        layout.addWidget(QLabel("Axis Data"))
+        layout.addWidget(self.axis_table)
+
+
         # --- Telemetry plots ---
         # Position plot (6 traces)
         self.plot_pos = pg.PlotWidget(title="Position (turns) — A1..A6")
@@ -214,7 +246,7 @@ class RobotGUI(QWidget):
         self.plot_pos.addLegend()
         self.curves_pos = []
         for i in range(6):
-            c = self.plot_pos.plot(name=f"A{i + 1}")
+            c = self.plot_pos.plot(name=f"A{i + 1}", pen=axis_pen(i, width=2))
             self.curves_pos.append(c)
         layout.addWidget(self.plot_pos)
 
@@ -226,7 +258,7 @@ class RobotGUI(QWidget):
         self.plot_vel.addLegend()
         self.curves_vel = []
         for i in range(6):
-            c = self.plot_vel.plot(name=f"A{i + 1}")
+            c = self.plot_vel.plot(name=f"A{i + 1}", pen=axis_pen(i, width=2))
             self.curves_vel.append(c)
         layout.addWidget(self.plot_vel)
 
@@ -239,8 +271,12 @@ class RobotGUI(QWidget):
         self.curves_temp_motor = []
         self.curves_temp_fet = []
         for i in range(6):
-            self.curves_temp_motor.append(self.plot_temp.plot(name=f"A{i + 1} Motor"))
-            self.curves_temp_fet.append(self.plot_temp.plot(name=f"A{i + 1} FET"))
+            self.curves_temp_motor.append(
+                self.plot_temp.plot(name=f"A{i + 1} Motor", pen=axis_pen(i, width=2, style=Qt.PenStyle.SolidLine))
+            )
+            self.curves_temp_fet.append(
+                self.plot_temp.plot(name=f"A{i + 1} FET", pen=axis_pen(i, width=2, style=Qt.PenStyle.DashLine))
+            )
         layout.addWidget(self.plot_temp)
 
         # Temperature Labels
@@ -273,8 +309,12 @@ class RobotGUI(QWidget):
         self.curves_cur_motor = []
         self.curves_cur_bus = []
         for i in range(6):
-            self.curves_cur_motor.append(self.plot_cur.plot(name=f"A{i + 1} Motor I"))
-            self.curves_cur_bus.append(self.plot_cur.plot(name=f"A{i + 1} Bus I"))
+            self.curves_cur_motor.append(
+                self.plot_cur.plot(name=f"A{i + 1} Motor I", pen=axis_pen(i, width=2, style=Qt.PenStyle.SolidLine))
+            )
+            self.curves_cur_bus.append(
+                self.plot_cur.plot(name=f"A{i + 1} Bus I", pen=axis_pen(i, width=2, style=Qt.PenStyle.DashLine))
+            )
         layout.addWidget(self.plot_cur)
 
 
@@ -286,8 +326,7 @@ class RobotGUI(QWidget):
         self.pos_buf = [[] for _ in range(6)]
         self.vel_buf = [[] for _ in range(6)]
 
-        self.vbus_x = []  # bus voltage time axis
-        self.vbus_y = []  # bus voltage values
+        self.bus_v_buf = [[] for _ in range(6)]
 
         self.cur_motor_buf = [[] for _ in range(6)]
         self.cur_bus_buf = [[] for _ in range(6)]
@@ -408,6 +447,20 @@ class RobotGUI(QWidget):
                 except Exception:
                     buf_list[i].append(float("nan"))
 
+    def _append_vec6_int(self, buf_list, vec):
+        """Append a length-6 vector to per-axis buffers. Missing/None -> None."""
+        if not isinstance(vec, list):
+            vec = []
+        for i in range(6):
+            v = vec[i] if i < len(vec) else None
+            if v is None:
+                buf_list[i].append(None)
+            else:
+                try:
+                    buf_list[i].append(int(v))
+                except Exception:
+                    buf_list[i].append(None)
+
     def _trim_history(self):
         if not self.tbuf:
             return
@@ -429,9 +482,40 @@ class RobotGUI(QWidget):
                 self.pos_buf, self.vel_buf,
                 self.temp_motor_buf, self.temp_fet_buf,
                 self.cur_motor_buf, self.cur_bus_buf,
+                self.bus_v_buf,
+                self.axis_state_buf, self.axis_error_buf,
         ):
             for i in range(6):
                 banks[i] = banks[i][k0:]
+
+    def _set_table_cell(self, row: int, col: int, value, fmt: str | None = None):
+        """
+        value can be float/int/None/NaN/str. If fmt is provided, it's used for numeric formatting.
+        """
+        # --- format text ---
+        if value is None:
+            text = "---"
+        elif isinstance(value, str):
+            text = value
+        else:
+            try:
+                v = float(value)
+                if v != v:  # NaN
+                    text = "---"
+                else:
+                    text = (fmt.format(v) if fmt else str(v))
+            except Exception:
+                text = "---"
+
+        item = self.axis_table.item(row, col)
+        if item is None:
+            item = QTableWidgetItem(text)
+            # Right align data cells
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.axis_table.setItem(row, col, item)
+        else:
+            item.setText(text)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
     def update_gui(self):
         updated = False
@@ -461,20 +545,45 @@ class RobotGUI(QWidget):
             # motor current is optional; will plot NaNs until you send it
             self._append_vec6(self.cur_motor_buf, telem.get("motor_i", []))
 
+            #bus voltage
+            self._append_vec6(self.bus_v_buf, telem.get("bus_v", []))
+
+            # heartbeat/state/error (match your telemetry keys)
+            # Expecting vectors like: "axis_state": [6], "axis_error": [6]
+            self._append_vec6_int(self.axis_state_buf, telem.get("axis_state", []))
+            self._append_vec6_int(self.axis_error_buf, telem.get("axis_error", []))
+
             self._trim_history()
             updated = True
 
-            # update the numeric pos/vel labels using the newest samples
-            for i in range(6):
-                p = self.pos_buf[i][-1] if self.pos_buf[i] else float("nan")
-                v = self.vel_buf[i][-1] if self.vel_buf[i] else float("nan")
-                p_text = "---" if (p != p) else f"{p:.4f}"
-                v_text = "---" if (v != v) else f"{v:.4f}"
-                self.fb_labels[i][0].setText(p_text)
-                self.fb_labels[i][1].setText(v_text)
-
         if not updated:
             return
+
+        # ---- Update numeric matrix using newest samples ----
+        for i in range(6):
+            state_i = self.axis_state_buf[i][-1] if self.axis_state_buf[i] else None
+            error_i = self.axis_error_buf[i][-1] if self.axis_error_buf[i] else None
+
+            pos_i = self.pos_buf[i][-1] if self.pos_buf[i] else float("nan")
+            vel_i = self.vel_buf[i][-1] if self.vel_buf[i] else float("nan")
+
+            motor_i = self.cur_motor_buf[i][-1] if self.cur_motor_buf[i] else float("nan")
+            bus_i   = self.cur_bus_buf[i][-1] if self.cur_bus_buf[i] else float("nan")
+            busv_i = self.bus_v_buf[i][-1] if self.bus_v_buf[i] else float("nan")
+
+            tm_i = self.temp_motor_buf[i][-1] if self.temp_motor_buf[i] else float("nan")
+            tf_i = self.temp_fet_buf[i][-1] if self.temp_fet_buf[i] else float("nan")
+
+            # Cols: State, Error, Pos, Vel, MotorI, BusV, BusI, TempMotor, TempFET
+            self._set_table_cell(i, 0, state_i, None)
+            self._set_table_cell(i, 1, error_i, None)
+            self._set_table_cell(i, 0, pos_i, "{:.4f}")
+            self._set_table_cell(i, 1, vel_i, "{:.4f}")
+            self._set_table_cell(i, 2, motor_i, "{:.2f}")
+            self._set_table_cell(i, 3, busv_i, "{:.2f}")
+            self._set_table_cell(i, 4, bus_i, "{:.2f}")
+            self._set_table_cell(i, 5, tm_i, "{:.1f}")
+            self._set_table_cell(i, 6, tf_i, "{:.1f}")
 
         # update plots
         x = self.tbuf
@@ -487,110 +596,6 @@ class RobotGUI(QWidget):
 
             self.curves_cur_bus[i].setData(x, self.cur_bus_buf[i])
             self.curves_cur_motor[i].setData(x, self.cur_motor_buf[i])
-
-    """             
-    def update_gui(self):
-        while not self.telem_queue.empty():
-            telem = self.telem_queue.get()
-            self.last_telem_time = time.time()
-
-            if isinstance(telem, dict):
-                t = float(telem.get("t", time.time()))
-
-                # Position & velocity
-                if "pos" in telem or "vel" in telem:
-                    pos = telem.get("pos", self.last_pos)
-                    vel = telem.get("vel", self.last_vel)
-
-                    # Update feedback labels
-                    for i in range(6):
-                        p = pos[i] if (isinstance(pos, list) and i < len(pos)) else None
-                        v = vel[i] if (isinstance(vel, list) and i < len(vel)) else None
-                        p_text = "---" if p is None else f"{float(p):.4f}"
-                        v_text = "---" if v is None else f"{float(v):.4f}"
-                        self.fb_labels[i][0].setText(p_text)
-                        self.fb_labels[i][1].setText(v_text)
-
-                    # Cache last values
-                    if isinstance(pos, list) and len(pos) >= 6:
-                        self.last_pos = [(float(x) if x is not None else float("nan")) for x in pos[:6]]
-                    if isinstance(vel, list) and len(vel) >= 6:
-                        self.last_vel = [(float(x) if x is not None else float("nan")) for x in vel[:6]]
-
-                    # Append data for axis 1
-                    self.xdata.append(t - self.start_time)
-                    a1 = self.last_pos[0] if self.last_pos and self.last_pos[0] == self.last_pos[0] else 0.0
-                    v1 = self.last_vel[0] if self.last_vel and self.last_vel[0] == self.last_vel[0] else 0.0
-                    self.ydata.append(a1)
-                    self.ydata_vel.append(v1)
-
-                    # Trim buffers
-                    if len(self.xdata) > 200:
-                        self.xdata = self.xdata[-200:]
-                        self.ydata = self.ydata[-200:]
-                        self.ydata_vel = self.ydata_vel[-200:]
-                # Bus voltage array
-                if "bus_v" in telem:
-                    vbus = telem.get("bus_v", [])
-                    if isinstance(vbus, list) and len(vbus) >= 1:
-                        if vbus[0] is not None:
-                            self.busv_label.setText(f"Bus Voltage (A1): {float(vbus[0]):.2f} V")
-                            self.vbus_x.append(t - self.start_time)
-                            self.vbus_y.append(float(vbus[0]))
-                            if len(self.vbus_x) > 200:
-                                self.vbus_x = self.vbus_x[-200:]
-                                self.vbus_y = self.vbus_y[-200:]
-                # Bus current array
-                if "bus_i" in telem:
-                    busi = telem.get("bus_i", [])
-                    if isinstance(busi, list) and len(busi) >= 1:
-                        if busi[0] is not None:
-                            self.busi_label.setText(f"Bus Current (A1): {float(busi[0]):.2f} A")
-                            self.busi_x.append(t - self.start_time)
-                            self.busi_y.append(float(busi[0]))
-                            if len(self.busi_x) > 200:
-                                self.busi_x = self.busi_x[-200:]
-                                self.busi_y = self.busi_y[-200:]
-                # Temperatures (arrays)
-                if "temp_fet" in telem:
-                    tf = telem.get("temp_fet", [])
-                    if isinstance(tf, list) and len(tf) >= 1 and tf[0] is not None:
-                        self.tempfet_label.setText(f"FET Temp (A1): {float(tf[0]):.1f} °C")
-                        self.tempfet_x.append(t - self.start_time)
-                        self.tempfet_y.append(float(tf[0]))
-                        if len(self.tempfet_x) > 200:
-                            self.tempfet_x = self.tempfet_x[-200:]
-                            self.tempfet_y = self.tempfet_y[-200:]
-
-                if "temp_motor" in telem:
-                    tm = telem.get("temp_motor", [])
-                    if isinstance(tm, list) and len(tm) >= 1 and tm[0] is not None:
-                        self.tempmotor_label.setText(f"Motor Temp (A1): {float(tm[0]):.1f} °C")
-                        self.tempmotor_x.append(t - self.start_time)
-                        self.tempmotor_y.append(float(tm[0]))
-                        if len(self.tempmotor_x) > 200:
-                            self.tempmotor_x = self.tempmotor_x[-200:]
-                            self.tempmotor_y = self.tempmotor_y[-200:]
-            elif isinstance(telem, (tuple, list)) and len(telem) >= 2:
-                try:
-                    t = float(telem[0])
-                    val = float(telem[1])
-                except Exception:
-                    continue
-                self.xdata.append(t - self.start_time)
-                self.ydata.append(val)
-                if len(self.xdata) > 200:
-                    self.xdata = self.xdata[-200:]
-                    self.ydata = self.ydata[-200:]
-
-        # Update plots
-        self.curve_pos.setData(self.xdata, self.ydata)
-        self.curve_vel.setData(self.xdata, self.ydata_vel)
-        self.busv_curve.setData(self.vbus_x, self.vbus_y)
-        self.busi_curve.setData(self.busi_x, self.busi_y)
-        self.tempfet_curve.setData(self.tempfet_x, self.tempfet_y)
-        self.tempmotor_curve.setData(self.tempmotor_x, self.tempmotor_y)
-    """
 
 # --- Simulated Robot ---  # (not used when connected to real robot)
 # def robot_sim(cmd_queue, telem_queue):
