@@ -114,6 +114,7 @@ class RobotState:
         self.axes_vel_estimate = [None] * 6
         self.axes_bus_voltage = [None] * 6
         self.axes_bus_current = [None] * 6
+        self.axes_motor_current = [None] * 6
         self.axes_temp_fet = [None] * 6
         self.axes_temp_motor = [None] * 6
         self.axes_axis_error = [None] * 6
@@ -150,6 +151,7 @@ class RobotState:
             vel_estimate=None,
             bus_voltage=None,
             bus_current=None,
+            motor_current=None,
             temp_fet=None,
             temp_motor=None,
             axis_error=None,
@@ -178,6 +180,11 @@ class RobotState:
             if bus_current is not None:  # <-- new
                 try:
                     self.axes_bus_current[axis_id] = float(bus_current)
+                except Exception:
+                    pass
+            if motor_current is not None:
+                try:
+                    self.axes_motor_current[axis_id] = float(motor_current)
                 except Exception:
                     pass
             if temp_fet is not None:
@@ -214,6 +221,10 @@ class RobotState:
     def get_bus_current(self):
         with self.lock:
             return list(self.axes_bus_current)
+
+    def get_motor_current(self):
+        with self.lock:
+            return list(self.axes_motor_current)
 
     def get_temp_fet(self):
         with self.lock:
@@ -423,6 +434,10 @@ class ODriveCANBridge(threading.Thread):
                 # bus voltage callback -> update RobotState
                 axis.on_bus(lambda vbus, ibus, i=aid:
                     self.state.set_axis_feedback(i, bus_voltage=vbus, bus_current=ibus))
+
+                # motor current callback
+                axis.on_iq(lambda iq_set, iq_meas, i=aid:
+                           self.state.set_axis_feedback(i, motor_current=iq_meas))
 
                 # temperatures callback, if your ODriveCANSimple exposes it
                 axis.on_temp(lambda fet, motor, i=aid:

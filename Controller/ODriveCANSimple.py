@@ -54,7 +54,7 @@ class ODriveAxis:
         self.manager._send(self.axis_id, 0x14, b"", rtr=True)
 
     def request_temp(self):
-        self.manager._send(self.axis_id, 0x18, b"", rtr=True)
+        self.manager._send(self.axis_id, 0x15, b"", rtr=True)
 
     def request_heartbeat(self):
         self.manager._send(self.axis_id, 0x01, b"", rtr=True)
