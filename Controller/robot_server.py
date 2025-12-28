@@ -116,6 +116,9 @@ class RobotState:
         self.axes_bus_current = [None] * 6
         self.axes_temp_fet = [None] * 6
         self.axes_temp_motor = [None] * 6
+        self.axes_axis_error = [None] * 6
+        self.axes_axis_state = [None] * 6
+        self.axes_proc_result = [None] * 6
         self.telem_thread = None
         self.telem_stop = threading.Event()
 
@@ -149,6 +152,9 @@ class RobotState:
             bus_current=None,
             temp_fet=None,
             temp_motor=None,
+            axis_error=None,
+            axis_state=None,
+            proc_result=None
     ):
         """Store measured feedback for a single axis index (0..5)."""
         if not (0 <= int(axis_id) < 6):                         #This hardcodes id's 0-5, this should be upgraded to check against a list of initialized controllers
@@ -184,6 +190,21 @@ class RobotState:
                     self.axes_temp_motor[axis_id] = float(temp_motor)
                 except Exception:
                     pass
+            if axis_error is not None:
+                try:
+                    self.axes_axis_error[axis_id] = int(axis_error)
+                except Exception:
+                    pass
+            if axis_state is not None:
+                try:
+                    self.axes_axis_state[axis_id] = int(axis_state)
+                except Exception:
+                    pass
+            if proc_result is not None:
+                try:
+                    self.axes_proc_result[axis_id] = int(proc_result)
+                except Exception:
+                    pass
 
     def get_bus_voltage(self):
         """Return list of bus voltage values (may contain None)."""
@@ -201,6 +222,18 @@ class RobotState:
     def get_temp_motor(self):
         with self.lock:
             return list(self.axes_temp_motor)
+
+    def get_axis_error(self):
+        with self.lock:
+            return list(self.axes_axis_error)
+
+    def get_axis_state(self):
+        with self.lock:
+            return list(self.axes_axis_state)
+
+    def get_proc_result(self):
+        with self.lock:
+            return list(self.axes_proc_result)
 
     def set_axes(self, positions):
         if not isinstance(positions, (list, tuple)) or len(positions) != 6:
@@ -394,6 +427,10 @@ class ODriveCANBridge(threading.Thread):
                 # temperatures callback, if your ODriveCANSimple exposes it
                 axis.on_temp(lambda fet, motor, i=aid:
                     self.state.set_axis_feedback(i, temp_fet=fet, temp_motor=motor))
+
+                # heartbeat callback
+                axis.on_heartbeat(lambda err, st, proc, i=aid:
+                    self.state.set_axis_feedback(i, axis_error=err, axis_state=st, proc_result=proc))
 
                 logger.info(f"[ODRV] axis {aid} registered callbacks")
 
