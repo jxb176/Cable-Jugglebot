@@ -427,8 +427,10 @@ class ODriveCANBridge(threading.Thread):
         self.axis_ids = axis_ids or [0, 1, 2, 3, 4, 5]
         self.manager = None
         self._stop = threading.Event()
-        self._applied_state_version = -1  # track changes
-        self._applied_home_version = -1
+
+        #Apply the current state version to avoid auto applying the default by setting these to -1.  Perhaps reconsider this for desired auto init behavior later on
+        self._applied_state_version = state.get_state_version()
+        self._applied_home_version = state.get_home_version()
 
     def stop(self):
         self._stop.set()
