@@ -32,6 +32,99 @@ def _queue_put_latest(q: Queue, item):
         pass
     q.put(item)
 
+# --- ODrive AxisState decode (int -> name) --- putting in as class constant now, this should move out when refactored
+AXIS_STATE_NAMES = {
+    0: "UNDEFINED",
+    1: "IDLE",
+    2: "STARTUP_SEQUENCE",
+    3: "FULL_CALIBRATION_SEQUENCE",
+    4: "MOTOR_CALIBRATION",
+    6: "ENCODER_INDEX_SEARCH",
+    7: "ENCODER_OFFSET_CALIBRATION",
+    8: "CLOSED_LOOP_CONTROL",
+    9: "LOCKIN_SPIN",
+    10: "ENCODER_DIR_FIND",
+    11: "HOMING",
+    12: "ENCODER_HALL_POLARITY_CALIBRATION",
+    13: "ENCODER_HALL_PHASE_CALIBRATION",
+    14: "ANTICOGGING_CALIBRATION",
+    15: "HARMONIC_CALIBRATION",
+    16: "HARMONIC_CALIBRATION_COMMUTATION",
+}
+
+def _axis_state_text(state_code):
+    if state_code is None:
+        return "---"
+    try:
+        sc = int(state_code)
+    except Exception:
+        return "---"
+    return AXIS_STATE_NAMES.get(sc, f"STATE_{sc}")
+
+# --- ODrive Error decode (bitmask -> names) ---
+ODRIVE_ERROR_BITS = {
+    0x00000001: "INITIALIZING",
+    0x00000002: "SYSTEM_LEVEL",
+    0x00000004: "TIMING_ERROR",
+    0x00000008: "MISSING_ESTIMATE",
+    0x00000010: "BAD_CONFIG",
+    0x00000020: "DRV_FAULT",
+    0x00000040: "MISSING_INPUT",
+    0x00000100: "DC_BUS_OVER_VOLTAGE",
+    0x00000200: "DC_BUS_UNDER_VOLTAGE",
+    0x00000400: "DC_BUS_OVER_CURRENT",
+    0x00000800: "DC_BUS_OVER_REGEN_CURRENT",
+    0x00001000: "CURRENT_LIMIT_VIOLATION",
+    0x00002000: "MOTOR_OVER_TEMP",
+    0x00004000: "INVERTER_OVER_TEMP",
+    0x00008000: "VELOCITY_LIMIT_VIOLATION",
+    0x00010000: "POSITION_LIMIT_VIOLATION",
+    0x01000000: "WATCHDOG_TIMER_EXPIRED",
+    0x02000000: "ESTOP_REQUESTED",
+    0x04000000: "SPINOUT_DETECTED",
+    0x08000000: "BRAKE_RESISTOR_DISARMED",
+    0x10000000: "THERMISTOR_DISCONNECTED",
+    0x40000000: "CALIBRATION_ERROR",
+}
+
+def _decode_odrive_error_mask(err_code):
+    """
+    Returns:
+      short_text: what to show in the table cell
+      tooltip: full breakdown (hex + list)
+    """
+    if err_code is None:
+        return "---", "No error data"
+    try:
+        code = int(err_code)
+    except Exception:
+        return "---", "Invalid error value"
+
+    if code == 0:
+        return "OK", "0x00000000 (no errors)"
+
+    names = []
+    # stable ordering by bit value
+    for bit in sorted(ODRIVE_ERROR_BITS.keys()):
+        if code & bit:
+            names.append(ODRIVE_ERROR_BITS[bit])
+
+    # Unknown bits (future firmware, etc.)
+    known_mask = 0
+    for bit in ODRIVE_ERROR_BITS.keys():
+        known_mask |= bit
+    unknown = code & (~known_mask)
+    if unknown:
+        names.append(f"UNKNOWN_BITS:0x{unknown:08X}")
+
+    # Short cell text: single name, or MULTI(n)
+    if len(names) == 1:
+        short = names[0]
+    else:
+        short = f"MULTI({len(names)})"
+
+    tooltip = " | ".join([f"0x{code:08X}"] + names)
+    return short, tooltip
 
 class CommandClient(threading.Thread):
     """TCP client that reliably sends commands to the robot with auto-reconnect."""
@@ -281,9 +374,10 @@ class RobotGUI(QWidget):
         self.axis_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.axis_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
 
-        # optional: nicer sizing
-        #self.axis_table.horizontalHeader().setStretchLastSection(True)
         self.axis_table.resizeColumnsToContents()
+        # Reserve space for text
+        self.axis_table.setColumnWidth(0, 150)  # State
+        self.axis_table.setColumnWidth(1, 150)  # Error
 
         layout.addWidget(QLabel("Axis Data"))
         layout.addWidget(self.axis_table)
@@ -561,10 +655,10 @@ class RobotGUI(QWidget):
             for i in range(6):
                 banks[i] = banks[i][k0:]
 
-    def _set_table_cell(self, row: int, col: int, value, fmt=None):
-
+    def _set_table_cell(self, row: int, col: int, value, fmt=None, align=None, tooltip=None):
         """
         value can be float/int/None/NaN/str. If fmt is provided, it's used for numeric formatting.
+        align: optional Qt.AlignmentFlag override for text alignment.
         """
         # --- format text ---
         if value is None:
@@ -584,12 +678,18 @@ class RobotGUI(QWidget):
         item = self.axis_table.item(row, col)
         if item is None:
             item = QTableWidgetItem(text)
-            # Right align data cells
-            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.axis_table.setItem(row, col, item)
         else:
             item.setText(text)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # Default: right-align (numbers); allow override (e.g. state text)
+        if align is None:
+            align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        item.setTextAlignment(align)
+
+        # Tooltip (mouseover)
+        if tooltip is not None:
+            item.setToolTip(str(tooltip))
 
     def update_gui(self):
         updated = False
@@ -635,8 +735,13 @@ class RobotGUI(QWidget):
 
         # ---- Update numeric matrix using newest samples ----
         for i in range(6):
-            state_i = self.axis_state_buf[i][-1] if self.axis_state_buf[i] else None
-            error_i = self.axis_error_buf[i][-1] if self.axis_error_buf[i] else None
+            state_code = self.axis_state_buf[i][-1] if self.axis_state_buf[i] else None
+            state_text = _axis_state_text(state_code)
+            # Include both code + full name in tooltip (nice for debugging)
+            state_tip = f"{state_text} ({state_code})" if state_code is not None else state_text
+
+            error_code = self.axis_error_buf[i][-1] if self.axis_error_buf[i] else None
+            error_text, error_tip = _decode_odrive_error_mask(error_code)
 
             pos_i = self.pos_buf[i][-1] if self.pos_buf[i] else float("nan")
             vel_i = self.vel_buf[i][-1] if self.vel_buf[i] else float("nan")
@@ -649,8 +754,8 @@ class RobotGUI(QWidget):
             tf_i = self.temp_fet_buf[i][-1] if self.temp_fet_buf[i] else float("nan")
 
             # Cols: State, Error, Pos, Vel, MotorI, BusV, BusI, TempMotor, TempFET
-            self._set_table_cell(i, 0, state_i, None)
-            self._set_table_cell(i, 1, error_i, None)
+            self._set_table_cell(i, 0, state_text, tooltip=state_text)
+            self._set_table_cell(i, 1, error_text, tooltip=error_tip)
             self._set_table_cell(i, 2, pos_i, "{:.4f}")
             self._set_table_cell(i, 3, vel_i, "{:.4f}")
             self._set_table_cell(i, 4, motor_i, "{:.2f}")
