@@ -149,23 +149,45 @@ class RobotGUI(QWidget):
         self.status_label = QLabel("Telemetry: waiting...")
         layout.addWidget(self.status_label)
 
-        # Axis controls (1-6) in turns
-        axes_layout = QVBoxLayout()
-        self.axis_spins = []
+        # ---- Manual Position Command (Turns) ----
+        layout.addWidget(QLabel("Manual Position Command (Turns)"))
+
+        man_layout = QVBoxLayout()
+
+        # row of 6 spin boxes
+        spins_row = QHBoxLayout()
+        self.manual_spins = []
         for i in range(6):
-            row = QHBoxLayout()
-            lbl = QLabel(f"Axis {i+1} (turns)")
-            spin = QDoubleSpinBox()
-            spin.setDecimals(3)
-            spin.setRange(-10.0, 10.0)
-            spin.setSingleStep(0.01)
-            spin.setValue(0.0)
-            spin.valueChanged.connect(self.send_axes)  # Send axes command on change
-            row.addWidget(lbl)
-            row.addWidget(spin)
-            axes_layout.addLayout(row)
-            self.axis_spins.append(spin)
-        layout.addLayout(axes_layout)
+            col = QVBoxLayout()
+            col.addWidget(QLabel(f"A{i + 1}"))
+
+            sp = QDoubleSpinBox()
+            sp.setDecimals(4)
+            sp.setRange(-1000.0, 1000.0)
+            sp.setSingleStep(0.01)
+            sp.setValue(0.0)
+
+            # IMPORTANT: do NOT auto-send on valueChanged anymore
+            # (we only send when MOVE is pressed)
+            col.addWidget(sp)
+            spins_row.addLayout(col)
+            self.manual_spins.append(sp)
+
+        man_layout.addLayout(spins_row)
+
+        # buttons row
+        btn_row = QHBoxLayout()
+        self.btn_move = QPushButton("MOVE")
+        self.btn_update_to_current = QPushButton("UPDATE TO CURRENT POSITION")
+
+        self.btn_move.clicked.connect(self.send_manual_move)
+        self.btn_update_to_current.clicked.connect(self.update_manual_to_current)
+
+        btn_row.addWidget(self.btn_move)
+        btn_row.addWidget(self.btn_update_to_current)
+        man_layout.addLayout(btn_row)
+
+        layout.addLayout(man_layout)
 
         # ---- Home position inputs + button ----
         home_layout = QVBoxLayout()
@@ -403,6 +425,27 @@ class RobotGUI(QWidget):
         cmd = {"type": "home", "home_pos": positions, "units": "turns"}
         _queue_put_latest(self.cmd_queue, cmd)
         self.status_label.setText("HOME command sent")
+
+    def send_manual_move(self):
+        positions = [float(sp.value()) for sp in self.manual_spins]
+        cmd = {"type": "axes", "positions": positions, "units": "turns"}
+        _queue_put_latest(self.cmd_queue, cmd)
+        self.status_label.setText("MOVE command sent")
+
+    def update_manual_to_current(self):
+        # Prefer newest telemetry sample; fall back safely if missing
+        for i in range(6):
+            v = float("nan")
+            if i < len(self.pos_buf) and self.pos_buf[i]:
+                v = self.pos_buf[i][-1]
+
+            if v == v:  # not NaN
+                # block signals so we don't trigger any auto-send on valueChanged
+                self.manual_spins[i].blockSignals(True)
+                self.manual_spins[i].setValue(float(v))
+                self.manual_spins[i].blockSignals(False)
+
+        self.status_label.setText("Manual positions updated from current feedback")
 
     def _load_csv_as_profile(self, path: str):
         rows = []
