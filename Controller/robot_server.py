@@ -27,33 +27,41 @@ TELEMETRY_RATE_HZ = 50.0
 MM_PER_TURN = [-62.832] * 6  # 2*pi*10mm = 62.832 mm/turn, with sign convention applied
 
 
-def _mm_to_turns(mm_list):
-    """Convert length [mm] -> motor position [turns]."""
+def mm_to_turns(mm_list):
+    """Convert [mm] -> [turns] elementwise using MM_PER_TURN."""
     if not isinstance(mm_list, (list, tuple)) or len(mm_list) != 6:
         raise ValueError("mm_list must be length-6 list/tuple")
-    return [float(mm_list[i]) / float(MM_PER_TURN[i]) for i in range(6)]
-
-
-def _turns_to_mm(turns_list):
-    """Convert motor position [turns] -> length [mm]."""
-    if turns_list is None:
-        return None
     out = []
     for i in range(6):
-        v = turns_list[i] if i < len(turns_list) else None
-        out.append(None if v is None else float(v) * float(MM_PER_TURN[i]))
+        mm = float(mm_list[i])
+        k = float(MM_PER_TURN[i])  # mm/turn
+        out.append(mm / k)         # turns
     return out
 
-
-def _turnsps_to_mmps(turnsps_list):
-    """Convert motor velocity [turns/s] -> length rate [mm/s]."""
-    if turnsps_list is None:
-        return None
+def turns_to_mm(turns_list):
+    """Convert [turns] -> [mm] elementwise using MM_PER_TURN."""
+    if not isinstance(turns_list, (list, tuple)) or len(turns_list) != 6:
+        raise ValueError("turns_list must be length-6 list/tuple")
     out = []
     for i in range(6):
-        v = turnsps_list[i] if i < len(turnsps_list) else None
-        out.append(None if v is None else float(v) * float(MM_PER_TURN[i]))
+        trn = float(turns_list[i])
+        k = float(MM_PER_TURN[i])  # mm/turn
+        out.append(trn * k)        # mm
     return out
+
+def _coerce_vec6_to_mm(msg, field_name: str):
+    vec = msg.get(field_name, [])
+    units = (msg.get("units") or "mm").lower()
+    if not isinstance(vec, (list, tuple)) or len(vec) != 6:
+        raise ValueError(f"{field_name} must be length-6 list")
+    vec = [float(x) for x in vec]
+
+    if units == "mm":
+        return vec
+    elif units == "turns":
+        return turns_to_mm(vec)
+    else:
+        raise ValueError(f"Unknown units '{units}' (expected 'mm' or 'turns')")
 
 os.environ.setdefault("CAN_CHANNEL", ODRIVE_INTERFACE)
 os.environ.setdefault("CAN_BITRATE", str(ODRIVE_BITRATE))
@@ -186,7 +194,7 @@ class RobotState:
         with self.lock:
             self.home_pos = [float(x) for x in home_pos]
             self.home_version += 1
-        logger.info("HOME requested: " + ", ".join(f"{x:.4f}" for x in self.home_pos))
+        logger.info("HOME requested (mm): " + ", ".join(f"{x:.3f}" for x in self.home_pos))
 
     def get_home_version(self):
         with self.lock:
@@ -304,7 +312,7 @@ class RobotState:
             raise ValueError("positions must be length-6 list/tuple")
         with self.lock:
             self.axes_pos_cmd = [float(x) for x in positions]
-        logger.info("Axes target set: " + ", ".join(f"{x:.4f}" for x in self.axes_pos_cmd))
+        logger.info("Axes target set (mm): " + ", ".join(f"{x:.3f}" for x in self.axes_pos_cmd))
 
     def set_state(self, value: str):
         value = str(value).lower()
@@ -524,12 +532,13 @@ class ODriveCANBridge(threading.Thread):
 
                 # Stream setpoints if enabled
                 if st == "enable":
-                    pos_cmd = self.state.get_pos_cmd()
+                    pos_cmd_mm = self.state.get_pos_cmd()  # mm
+                    pos_cmd_turns = mm_to_turns(pos_cmd_mm)  # turns for ODrive
                     for i, aid in enumerate(self.axis_ids):
                         try:
                             axis = self.manager.axes.get(aid)
                             if axis is not None:
-                                axis.set_input_pos(pos_cmd[i])
+                                axis.set_input_pos(pos_cmd_turns[i])
                         except Exception as e:
                             logger.warning(f"[ODRV] axis {aid} set_input_pos failed: {e}")
 
@@ -577,28 +586,26 @@ class ODriveCANBridge(threading.Thread):
         if not self.manager:
             return
 
-        home_pos = self.state.get_home_pos()
+        home_pos_mm = self.state.get_home_pos()  # mm
 
-        # 1) Update command setpoints first (prevents any mismatch on next stream tick)
+        # 1) Update command setpoints first
         try:
-            self.state.set_axes(home_pos)
+            self.state.set_axes(home_pos_mm)  # keep cmd in mm
         except Exception as e:
-            logger.error(f"[HOME] Failed to set_axes(home_pos): {e}")
+            logger.error(f"[HOME] Failed to set_axes(home_pos_mm): {e}")
 
-        # 2) Send Set_Absolute_Position to each axis
+        # 2) Send Set_Absolute_Position to each axis (in turns)
+        home_pos_turns = mm_to_turns(home_pos_mm)
         for i, aid in enumerate(self.axis_ids):
             axis = self.manager.axes.get(aid)
             if not axis:
                 continue
             try:
-                axis.set_absolute_position(home_pos[i])
-                # optional: also set input_pos immediately once, to match setpoint now
-                axis.set_input_pos(home_pos[i])
-                logger.info(f"[HOME] axis {aid}: abs_pos <- {home_pos[i]:.4f} turns (from mm home cmd)")
+                axis.set_absolute_position(home_pos_turns[i])
+                axis.set_input_pos(home_pos_turns[i])
+                logger.info(f"[HOME] axis {aid}: abs_pos <- {home_pos_mm[i]:.3f} mm ({home_pos_turns[i]:.4f} turns)")
             except Exception as e:
                 logger.warning(f"[HOME] axis {aid} set_absolute_position failed: {e}")
-
-
 
 
 def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
@@ -607,10 +614,18 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
             controller_ip = state.get_controller_ip()
             if controller_ip:
                 controller_addr = (controller_ip, UDP_TELEM_PORT)
-                fb_pos = state.get_pos_fbk()
-                fb_vel = state.get_vel_fbk()
-                fb_pos_mm = _turns_to_mm(fb_pos_turns)
-                fb_vel_mmps = _turnsps_to_mmps(fb_vel_turnsps)
+                fb_pos_turns = state.get_pos_fbk()
+                fb_vel_turnsps = state.get_vel_fbk()
+
+                # Convert to mm + mm/s for the GUI
+                fb_pos_mm = []
+                fb_vel_mms = []
+                for i in range(6):
+                    p = fb_pos_turns[i] if i < len(fb_pos_turns) else None
+                    v = fb_vel_turns[i] if i < len(fb_vel_turns) else None
+                    k = MM_PER_TURN[i]
+                    fb_pos_mm.append(None if p is None else float(p) * k)
+                    fb_vel_mms.append(None if v is None else float(v) * k)
 
                 bus_v = state.get_bus_voltage() or []
                 bus_i = state.get_bus_current() or []
@@ -697,15 +712,13 @@ def tcp_command_server(state: RobotState):
                         msg = json.loads(line.strip())
                         mtype = msg.get("type")
                         if mtype == "axes":
-                            pos_mm = msg.get("positions", [])
-                            pos_turns = _mm_to_turns(pos_mm)
-                            state.set_axes(pos_turns)
+                            pos_mm = _coerce_vec6_to_mm(msg, "positions")
+                            state.set_axes(pos_mm)
                         elif mtype == "state":
                             state.set_state(msg.get("value", "disable"))
                         elif mtype == "home":
-                            home_mm = msg.get("home_pos", [])
-                            home_turns = _mm_to_turns(home_mm)
-                            state.request_home(home_turns)
+                            home_mm = _coerce_vec6_to_mm(msg, "home_pos")
+                            state.request_home(home_mm)
                         elif mtype == "profile_upload":
                             profile_mm = msg.get("profile", [])
 
