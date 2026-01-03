@@ -22,6 +22,39 @@ ODRIVE_COMMAND_RATE_HZ = 500.0
 ODRIVE_LOG_RATE_HZ = 2.0
 TELEMETRY_RATE_HZ = 50.0
 
+# -------- Capstan / units configuration --------
+# +turns (ODrive) reduces cable length, so use negative mm/turn such that +mm command extends cable.
+MM_PER_TURN = [-62.832] * 6  # 2*pi*10mm = 62.832 mm/turn, with sign convention applied
+
+
+def _mm_to_turns(mm_list):
+    """Convert length [mm] -> motor position [turns]."""
+    if not isinstance(mm_list, (list, tuple)) or len(mm_list) != 6:
+        raise ValueError("mm_list must be length-6 list/tuple")
+    return [float(mm_list[i]) / float(MM_PER_TURN[i]) for i in range(6)]
+
+
+def _turns_to_mm(turns_list):
+    """Convert motor position [turns] -> length [mm]."""
+    if turns_list is None:
+        return None
+    out = []
+    for i in range(6):
+        v = turns_list[i] if i < len(turns_list) else None
+        out.append(None if v is None else float(v) * float(MM_PER_TURN[i]))
+    return out
+
+
+def _turnsps_to_mmps(turnsps_list):
+    """Convert motor velocity [turns/s] -> length rate [mm/s]."""
+    if turnsps_list is None:
+        return None
+    out = []
+    for i in range(6):
+        v = turnsps_list[i] if i < len(turnsps_list) else None
+        out.append(None if v is None else float(v) * float(MM_PER_TURN[i]))
+    return out
+
 os.environ.setdefault("CAN_CHANNEL", ODRIVE_INTERFACE)
 os.environ.setdefault("CAN_BITRATE", str(ODRIVE_BITRATE))
 
@@ -561,7 +594,7 @@ class ODriveCANBridge(threading.Thread):
                 axis.set_absolute_position(home_pos[i])
                 # optional: also set input_pos immediately once, to match setpoint now
                 axis.set_input_pos(home_pos[i])
-                logger.info(f"[HOME] axis {aid}: abs_pos <- {home_pos[i]:.4f} turns")
+                logger.info(f"[HOME] axis {aid}: abs_pos <- {home_pos[i]:.4f} turns (from mm home cmd)")
             except Exception as e:
                 logger.warning(f"[HOME] axis {aid} set_absolute_position failed: {e}")
 
@@ -576,6 +609,9 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
                 controller_addr = (controller_ip, UDP_TELEM_PORT)
                 fb_pos = state.get_pos_fbk()
                 fb_vel = state.get_vel_fbk()
+                fb_pos_mm = _turns_to_mm(fb_pos_turns)
+                fb_vel_mmps = _turnsps_to_mmps(fb_vel_turnsps)
+
                 bus_v = state.get_bus_voltage() or []
                 bus_i = state.get_bus_current() or []
                 motor_i = state.get_motor_current() or []
@@ -585,8 +621,8 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
                 axis_error = state.get_axis_error() or []
                 msg = {
                     "t": time.time(),
-                    "pos": [None if v is None else float(v) for v in fb_pos],
-                    "vel": [None if v is None else float(v) for v in fb_vel],
+                    "pos": fb_pos_mm,
+                    "vel": fb_vel_mmps,
                     "bus_v": [None if v is None else float(v) for v in bus_v],
                     "bus_i": [None if i is None else float(i) for i in bus_i],
                     "motor_i": [None if x is None else float(x) for x in motor_i],
@@ -661,14 +697,29 @@ def tcp_command_server(state: RobotState):
                         msg = json.loads(line.strip())
                         mtype = msg.get("type")
                         if mtype == "axes":
-                            state.set_axes(msg.get("positions", []))
+                            pos_mm = msg.get("positions", [])
+                            pos_turns = _mm_to_turns(pos_mm)
+                            state.set_axes(pos_turns)
                         elif mtype == "state":
                             state.set_state(msg.get("value", "disable"))
                         elif mtype == "home":
-                            state.request_home(msg.get("home_pos", []))
+                            home_mm = msg.get("home_pos", [])
+                            home_turns = _mm_to_turns(home_mm)
+                            state.request_home(home_turns)
                         elif mtype == "profile_upload":
-                            profile = msg.get("profile", [])
-                            state.set_profile(profile)
+                            profile_mm = msg.get("profile", [])
+
+                            # Convert each row: [t, a1..a6] where a1..a6 are mm -> turns
+                            profile_turns = []
+                            for row in profile_mm:
+                                if not isinstance(row, (list, tuple)) or len(row) < 7:
+                                    raise ValueError("each profile row must be [t, a1..a6]")
+                                t = float(row[0])
+                                axes_mm = [float(x) for x in row[1:7]]
+                                axes_turns = _mm_to_turns(axes_mm)
+                                profile_turns.append([t] + axes_turns)
+
+                            state.set_profile(profile_turns)
                         elif mtype == "profile_start":
                             rate_hz = float(msg.get("rate_hz", 100.0))
                             state.start_profile(rate_hz)

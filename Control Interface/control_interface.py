@@ -242,8 +242,8 @@ class RobotGUI(QWidget):
         self.status_label = QLabel("Telemetry: waiting...")
         layout.addWidget(self.status_label)
 
-        # ---- Manual Position Command (Turns) ----
-        layout.addWidget(QLabel("Manual Position Command (Turns)"))
+        # ---- Manual Position Command (mm) ----
+        layout.addWidget(QLabel("Manual Position Command (mm)"))
 
         man_layout = QVBoxLayout()
 
@@ -255,9 +255,9 @@ class RobotGUI(QWidget):
             col.addWidget(QLabel(f"A{i + 1}"))
 
             sp = QDoubleSpinBox()
-            sp.setDecimals(4)
+            sp.setDecimals(2)
             sp.setRange(-1000.0, 1000.0)
-            sp.setSingleStep(0.01)
+            sp.setSingleStep(1.0)
             sp.setValue(0.0)
 
             # IMPORTANT: do NOT auto-send on valueChanged anymore
@@ -352,8 +352,8 @@ class RobotGUI(QWidget):
         self.axis_table_cols = [
             "State",
             "Error",
-            "Pos (turns)",
-            "Vel (turns/s)",
+            "Pos (mm)",
+            "Vel (mm/s)",
             "Motor I (A)",
             "Bus V (V)",
             "Bus I (A)",
@@ -385,9 +385,9 @@ class RobotGUI(QWidget):
 
         # --- Telemetry plots ---
         # Position plot (6 traces)
-        self.plot_pos = pg.PlotWidget(title="Position (turns) — A1..A6")
+        self.plot_pos = pg.PlotWidget(title="Position (mm) — A1..A6")
         self.plot_pos.setLabel("bottom", "Time", "s")
-        self.plot_pos.setLabel("left", "Position", "turns")
+        self.plot_pos.setLabel("left", "Position", "mm")
         self.plot_pos.showGrid(x=True, y=True)
         self.plot_pos.addLegend()
         self.curves_pos = []
@@ -397,9 +397,9 @@ class RobotGUI(QWidget):
         layout.addWidget(self.plot_pos)
 
         # Velocity plot (6 traces)
-        self.plot_vel = pg.PlotWidget(title="Velocity (turns/s) — A1..A6")
+        self.plot_vel = pg.PlotWidget(title="Velocity (mm/s) — A1..A6")
         self.plot_vel.setLabel("bottom", "Time", "s")
-        self.plot_vel.setLabel("left", "Velocity", "turns/s")
+        self.plot_vel.setLabel("left", "Velocity", "mm/s")
         self.plot_vel.showGrid(x=True, y=True)
         self.plot_vel.addLegend()
         self.curves_vel = []
@@ -507,7 +507,7 @@ class RobotGUI(QWidget):
 
     def send_axes(self, *_):
         positions = [float(sp.value()) for sp in self.axis_spins]
-        cmd = {"type": "axes", "positions": positions, "units": "turns"}
+        cmd = {"type": "axes", "positions": positions, "units": "mm"}
         _queue_put_latest(self.cmd_queue, cmd)
 
     def send_state(self, state_value: str):
@@ -516,13 +516,13 @@ class RobotGUI(QWidget):
 
     def send_home(self):
         positions = [float(sp.value()) for sp in self.home_spins]
-        cmd = {"type": "home", "home_pos": positions, "units": "turns"}
+        cmd = {"type": "home", "home_pos": positions, "units": "mm"}
         _queue_put_latest(self.cmd_queue, cmd)
         self.status_label.setText("HOME command sent")
 
     def send_manual_move(self):
         positions = [float(sp.value()) for sp in self.manual_spins]
-        cmd = {"type": "axes", "positions": positions, "units": "turns"}
+        cmd = {"type": "axes", "positions": positions, "units": "mm"}
         _queue_put_latest(self.cmd_queue, cmd)
         self.status_label.setText("MOVE command sent")
 
@@ -756,8 +756,8 @@ class RobotGUI(QWidget):
             # Cols: State, Error, Pos, Vel, MotorI, BusV, BusI, TempMotor, TempFET
             self._set_table_cell(i, 0, state_text, tooltip=state_text)
             self._set_table_cell(i, 1, error_text, tooltip=error_tip)
-            self._set_table_cell(i, 2, pos_i, "{:.4f}")
-            self._set_table_cell(i, 3, vel_i, "{:.4f}")
+            self._set_table_cell(i, 2, pos_i, "{:.2f}")
+            self._set_table_cell(i, 3, vel_i, "{:.2f}")
             self._set_table_cell(i, 4, motor_i, "{:.2f}")
             self._set_table_cell(i, 5, busv_i, "{:.2f}")
             self._set_table_cell(i, 6, bus_i, "{:.2f}")
