@@ -311,6 +311,28 @@ class RobotGUI(QWidget):
 
         layout.addLayout(home_layout)
 
+        # ---- Pretension inputs ----
+        pret_layout = QHBoxLayout()
+
+        pret_layout.addWidget(QLabel("Pretension Upper (A1,A3,A5) [N]:"))
+        self.pret_upper_spin = QDoubleSpinBox()
+        self.pret_upper_spin.setDecimals(2)
+        self.pret_upper_spin.setRange(0.0, 500.0)
+        self.pret_upper_spin.setSingleStep(1.0)
+        pret_layout.addWidget(self.pret_upper_spin)
+
+        pret_layout.addWidget(QLabel("Pretension Lower (A2,A4,A6) [N]:"))
+        self.pret_lower_spin = QDoubleSpinBox()
+        self.pret_lower_spin.setDecimals(2)
+        self.pret_lower_spin.setRange(0.0, 500.0)
+        self.pret_lower_spin.setSingleStep(1.0)
+        pret_layout.addWidget(self.pret_lower_spin)
+
+        self.btn_pretension = QPushButton("PRETENSION")
+        self.btn_pretension.clicked.connect(self.send_pretension)
+        pret_layout.addWidget(self.btn_pretension)
+
+        layout.addLayout(pret_layout)
 
         # State controls
         state_layout = QHBoxLayout()
@@ -519,6 +541,17 @@ class RobotGUI(QWidget):
         cmd = {"type": "home", "home_pos": positions, "units": "mm"}
         _queue_put_latest(self.cmd_queue, cmd)
         self.status_label.setText("HOME command sent")
+
+    def send_pretension(self):
+        upper = float(self.pret_upper_spin.value())
+        lower = float(self.pret_lower_spin.value())
+        cmd = {
+            "type": "pretension",
+            "upper_N": upper,
+            "lower_N": lower,
+        }
+        _queue_put_latest(self.cmd_queue, cmd)
+        self.status_label.setText(f"PRETENSION: upper={upper:.2f} N, lower={lower:.2f} N")
 
     def send_manual_move(self):
         positions = [float(sp.value()) for sp in self.manual_spins]

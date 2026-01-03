@@ -47,6 +47,11 @@ class ODriveAxis:
         payload = struct.pack("<f", float(pos_turns))  # float32, little-endian
         self.manager._send(self.axis_id, 0x19, payload, rtr=False)
 
+    def set_controller_mode(self, control_mode: int, input_mode: int):
+        # CANSimple: Set_Controller_Mode (0x00B): 2x uint32 (little endian)
+        payload = int(control_mode).to_bytes(4, "little") + int(input_mode).to_bytes(4, "little")
+        self.manager._send(self.axis_id, 0x0B, payload)
+
     # ---------------- Requests ----------------
     def request_encoder_estimates(self):
         self.manager._send(self.axis_id, 0x09, b"", rtr=True)

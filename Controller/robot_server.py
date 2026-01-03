@@ -25,7 +25,15 @@ TELEMETRY_RATE_HZ = 50.0
 # -------- Capstan / units configuration --------
 # +turns (ODrive) reduces cable length, so use negative mm/turn such that +mm command extends cable.
 MM_PER_TURN = [-62.832] * 6  # 2*pi*10mm = 62.832 mm/turn, with sign convention applied
+# Pretension mapping: tension [N] -> capstan torque [Nm]
+CAPSTAN_RADIUS_M = 0.010  # 10 mm
+TORQUE_PER_TENSION = CAPSTAN_RADIUS_M  # Nm per N  (T = F*r)
 
+#CLEANUP into ODRIVE library
+# ODrive controller modes (CANSimple Set_Controller_Mode)
+CONTROL_MODE_TORQUE = 1      # aka "CurrentControl" in some docs
+CONTROL_MODE_POSITION = 3
+INPUT_MODE_PASSTHROUGH = 1
 
 def mm_to_turns(mm_list):
     """Convert [mm] -> [turns] elementwise using MM_PER_TURN."""
@@ -165,6 +173,9 @@ class RobotState:
         self.axes_proc_result = [None] * 6
         self.telem_thread = None
         self.telem_stop = threading.Event()
+        self.pret_upper_N = 0.0
+        self.pret_lower_N = 0.0
+        self.pret_version = 0
 
     def set_controller_ip(self, ip):
         with self.lock:
@@ -316,7 +327,7 @@ class RobotState:
 
     def set_state(self, value: str):
         value = str(value).lower()
-        if value not in ("enable", "disable", "estop"):
+        if value not in ("enable", "disable", "estop", "pretension"):
             raise ValueError("invalid state")
         with self.lock:
             self.state = value
@@ -395,6 +406,26 @@ class RobotState:
             logger.info("[UDP] Telemetry thread stopped")
         self.telem_thread = None
 
+    #Pretension methods
+    def request_pretension(self, upper_N: float, lower_N: float):
+        with self.lock:
+            self.pret_upper_N = float(upper_N)
+            self.pret_lower_N = float(lower_N)
+            self.pret_version += 1
+            self.state = "pretension"
+            self.state_version += 1
+        logger.info(f"[PRET] requested upper={self.pret_upper_N:.3f} N, lower={self.pret_lower_N:.3f} N "
+                    f"(pret_version {self.pret_version})")
+
+    def get_pretension(self):
+        with self.lock:
+            return float(self.pret_upper_N), float(self.pret_lower_N)
+
+    def get_pretension_version(self):
+        with self.lock:
+            return int(self.pret_version)
+
+
 class ProfilePlayer(threading.Thread):
     """Plays a time-position profile with linear interpolation at fixed rate."""
 
@@ -472,6 +503,7 @@ class ODriveCANBridge(threading.Thread):
         #Apply the current state version to avoid auto applying the default by setting these to -1.  Perhaps reconsider this for desired auto init behavior later on
         self._applied_state_version = state.get_state_version()
         self._applied_home_version = state.get_home_version()
+        self._applied_pret_version = state.get_pretension_version()
 
     def stop(self):
         self._stop.set()
@@ -530,6 +562,12 @@ class ODriveCANBridge(threading.Thread):
                     self._apply_home()
                     self._applied_home_version = hv
 
+                # Apply PRETENSION request when version changes
+                pv = self.state.get_pretension_version()
+                if pv != self._applied_pret_version:
+                    self._apply_pretension_mode()
+                    self._applied_pret_version = pv
+
                 # Stream setpoints if enabled
                 if st == "enable":
                     pos_cmd_mm = self.state.get_pos_cmd()  # mm
@@ -541,6 +579,23 @@ class ODriveCANBridge(threading.Thread):
                                 axis.set_input_pos(pos_cmd_turns[i])
                         except Exception as e:
                             logger.warning(f"[ODRV] axis {aid} set_input_pos failed: {e}")
+                elif st == "pretension":
+                    upper_N, lower_N = self.state.get_pretension()
+
+                    # Map upper/lower tension to per-axis torque commands
+                    torque_cmd = [0.0] * 6
+                    for i in (0, 2, 4):
+                        torque_cmd[i] = upper_N * TORQUE_PER_TENSION
+                    for i in (1, 3, 5):
+                        torque_cmd[i] = lower_N * TORQUE_PER_TENSION
+
+                    for i, aid in enumerate(self.axis_ids):
+                        try:
+                            axis = self.manager.axes.get(aid)
+                            if axis is not None:
+                                axis.set_input_torque(torque_cmd[i])
+                        except Exception as e:
+                            logger.warning(f"[ODRV] axis {aid} set_input_torque failed: {e}")
 
                 # light heartbeat log
                 now = time.perf_counter()
@@ -567,12 +622,21 @@ class ODriveCANBridge(threading.Thread):
                 axis = self.manager.axes.get(aid) if self.manager else None
                 if not axis:
                     continue
+
                 if st == "enable":
-                    logger.info(f"[ODRV] axis {aid}: enabling CLOSED_LOOP_CONTROL")
+                    axis.set_controller_mode(CONTROL_MODE_POSITION, INPUT_MODE_PASSTHROUGH)
+                    logger.info(f"[ODRV] axis {aid}: POSITION + CLOSED_LOOP_CONTROL")
                     axis.set_axis_state(AxisState.CLOSED_LOOP_CONTROL)
+
+                elif st == "pretension":
+                    axis.set_controller_mode(CONTROL_MODE_TORQUE, INPUT_MODE_PASSTHROUGH)
+                    logger.info(f"[ODRV] axis {aid}: TORQUE + CLOSED_LOOP_CONTROL")
+                    axis.set_axis_state(AxisState.CLOSED_LOOP_CONTROL)
+
                 elif st in ("disable", "estop"):
-                    logger.info(f"[ODRV] axis {aid}: setting IDLE")
+                    logger.info(f"[ODRV] axis {aid}: IDLE")
                     axis.set_axis_state(AxisState.IDLE)
+
         except Exception as e:
             logger.error(f"[ODRV] _apply_state error: {e}")
 
@@ -606,6 +670,19 @@ class ODriveCANBridge(threading.Thread):
                 logger.info(f"[HOME] axis {aid}: abs_pos <- {home_pos_mm[i]:.3f} mm ({home_pos_turns[i]:.4f} turns)")
             except Exception as e:
                 logger.warning(f"[HOME] axis {aid} set_absolute_position failed: {e}")
+
+    def _apply_pretension_mode(self):
+        """Put all axes into torque control (passthrough) + closed loop."""
+        try:
+            for aid in self.axis_ids:
+                axis = self.manager.axes.get(aid) if self.manager else None
+                if not axis:
+                    continue
+                axis.set_controller_mode(CONTROL_MODE_TORQUE, INPUT_MODE_PASSTHROUGH)
+                axis.set_axis_state(AxisState.CLOSED_LOOP_CONTROL)
+            logger.info("[PRET] applied torque control mode to all axes")
+        except Exception as e:
+            logger.error(f"[PRET] _apply_pretension_mode error: {e}")
 
 
 def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
@@ -716,6 +793,10 @@ def tcp_command_server(state: RobotState):
                             state.set_axes(pos_mm)
                         elif mtype == "state":
                             state.set_state(msg.get("value", "disable"))
+                        elif mtype == "pretension":
+                            upper = float(msg.get("upper_N", 0.0))
+                            lower = float(msg.get("lower_N", 0.0))
+                            state.request_pretension(upper, lower)
                         elif mtype == "home":
                             home_mm = _coerce_vec6_to_mm(msg, "home_pos")
                             state.request_home(home_mm)
