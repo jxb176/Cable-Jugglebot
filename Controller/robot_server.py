@@ -619,13 +619,13 @@ def udp_telemetry_sender(state: RobotState, udp_sock, stop_event):
 
                 # Convert to mm + mm/s for the GUI
                 fb_pos_mm = []
-                fb_vel_mms = []
+                fb_vel_mmps = []
                 for i in range(6):
                     p = fb_pos_turns[i] if i < len(fb_pos_turns) else None
-                    v = fb_vel_turns[i] if i < len(fb_vel_turnsps) else None
+                    v = fb_vel_turnsps[i] if i < len(fb_vel_turnsps) else None
                     k = MM_PER_TURN[i]
                     fb_pos_mm.append(None if p is None else float(p) * k)
-                    fb_vel_mms.append(None if v is None else float(v) * k)
+                    fb_vel_mmps.append(None if v is None else float(v) * k)
 
                 bus_v = state.get_bus_voltage() or []
                 bus_i = state.get_bus_current() or []
