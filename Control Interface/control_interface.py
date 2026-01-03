@@ -285,7 +285,7 @@ class RobotGUI(QWidget):
         # ---- Home position inputs + button ----
         home_layout = QVBoxLayout()
 
-        home_layout.addWidget(QLabel("Home Position (Turns)"))
+        home_layout.addWidget(QLabel("Home Position (mm)"))
 
         self.home_spins = []
         row = QHBoxLayout()
