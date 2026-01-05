@@ -207,6 +207,7 @@ class RobotState:
         self.hand_t_mm = (0.0, 0.0, 0.0)
         self.hand_q = (1.0, 0.0, 0.0, 0.0)
         self.hand_version = 0
+        self.pose_profile = []  # list of [t, x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg]
 
     def set_hand_pose(self, t_mm, q):
         # t_mm: (x,y,z) in mm, q: quaternion (w,x,y,z)
@@ -388,6 +389,7 @@ class RobotState:
         with self.lock:
             return self.state_version
 
+    #Profile methods (direct commands to axes)
     def set_profile(self, profile_points):
         if not isinstance(profile_points, (list, tuple)) or len(profile_points) == 0:
             raise ValueError("profile must be a non-empty list")
@@ -431,6 +433,38 @@ class RobotState:
             player.stop()
             player.join(timeout=1.0)
             logger.info("Profile stopped")
+
+    # Pose Profile methods
+    def set_pose_profile(self, profile_pose: list):
+        """
+        profile_pose rows: [t, x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg]
+        Stored as list[(t, [6])] similar shape to axis profile.
+        """
+        norm = []
+        for row in profile_pose:
+            if not isinstance(row, (list, tuple)) or len(row) < 7:
+                raise ValueError("each pose profile row must be [t, x,y,z,roll,pitch,yaw]")
+            t = float(row[0])
+            vals = [float(x) for x in row[1:7]]
+            norm.append((t, vals))
+        with self.lock:
+            self.pose_profile = norm
+        logger.info(f"Pose profile uploaded with {len(norm)} points")
+
+    def get_pose_profile(self):
+        with self.lock:
+            return list(self.pose_profile)
+
+    def start_pose_profile(self, rate_hz: float):
+        self.stop_profile()
+        prof = self.get_pose_profile()
+        if not prof:
+            raise RuntimeError("no pose profile uploaded")
+        player = PoseProfilePlayer(self, prof, rate_hz)
+        with self.lock:
+            self.player_thread = player
+        logger.info(f"Pose profile start at {rate_hz:.1f} Hz")
+        player.start()
 
     # --- Telemetry lifecycle ---
     def start_telem(self, udp_sock, controller_addr):
@@ -534,6 +568,87 @@ class ProfilePlayer(threading.Thread):
         with self.state.lock:
             if self.state.player_thread is self:
                 self.state.player_thread = None
+
+class PoseProfilePlayer(threading.Thread):
+    """
+    Plays a time-pose profile:
+      [t, x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg]
+    Converts pose -> quaternion -> IK -> axis mm commands, then calls state.set_axes(mm).
+    """
+
+    def __init__(self, state: RobotState, profile: list[tuple[float, list[float]]], rate_hz: float):
+        super().__init__(daemon=True)
+        self.state = state
+        self._stop = threading.Event()
+        if rate_hz <= 0:
+            raise ValueError("rate_hz must be > 0")
+        self.dt = 1.0 / rate_hz
+
+        if not profile:
+            raise ValueError("empty pose profile")
+
+        t0 = float(profile[0][0])
+        norm = []
+        for t, pose6 in profile:
+            norm.append((float(t) - t0, [float(x) for x in pose6]))
+        self.norm_profile = norm
+        self.duration = norm[-1][0] if norm else 0.0
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        if self.duration <= 0.0:
+            self._apply_pose(self.norm_profile[-1][1])
+            logger.info("[POSE_PROFILE] Zero-duration pose profile applied")
+            return
+
+        logger.info(f"[POSE_PROFILE] Starting playback at {1.0/self.dt:.1f} Hz, duration {self.duration:.3f}s")
+        start = time.perf_counter()
+        k = 0
+
+        while not self._stop.is_set():
+            t = time.perf_counter() - start
+            if t >= self.duration:
+                self._apply_pose(self.norm_profile[-1][1])
+                logger.info("[POSE_PROFILE] Completed")
+                break
+
+            while k + 1 < len(self.norm_profile) and self.norm_profile[k + 1][0] <= t:
+                k += 1
+
+            t0, p0 = self.norm_profile[k]
+            t1, p1 = self.norm_profile[min(k + 1, len(self.norm_profile) - 1)]
+            if t1 <= t0:
+                alpha = 0.0
+            else:
+                alpha = max(0.0, min(1.0, (t - t0) / (t1 - t0)))
+
+            pose = [p0[i] + alpha * (p1[i] - p0[i]) for i in range(6)]
+            try:
+                self._apply_pose(pose)
+            except Exception as e:
+                logger.error(f"[POSE_PROFILE] apply_pose error: {e}")
+
+            time.sleep(self.dt)
+
+        # cleanup
+        with self.state.lock:
+            if self.state.player_thread is self:
+                self.state.player_thread = None
+
+    def _apply_pose(self, pose6):
+        x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg = pose6
+
+        # You already have quat_from_rpy_deg, and you already handle pose commands similarly. :contentReference[oaicite:7]{index=7}
+        q = quat_from_rpy_deg(roll_deg, pitch_deg, yaw_deg)
+
+        # Reuse your existing "pose -> IK -> axes" path
+        # If your RobotState.set_hand_pose() already runs IK and updates axis commands, call it:
+        self.state.set_hand_pose((x_mm, y_mm, z_mm), q)
+
+        # If set_hand_pose currently only stores pose and doesn't compute IK yet,
+        # then instead call your cable_ik conversion here (whatever function you wired in).
 
 
 class ODriveCANBridge(threading.Thread):
@@ -888,6 +1003,13 @@ def tcp_command_server(state: RobotState):
                         elif mtype == "profile_start":
                             rate_hz = float(msg.get("rate_hz", 100.0))
                             state.start_profile(rate_hz)
+                        elif mtype == "pose_profile_upload":
+                            # expected rows: [t, x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg]
+                            profile = msg.get("profile", [])
+                            state.set_pose_profile(profile)
+                        elif mtype == "pose_profile_start":
+                            rate_hz = float(msg.get("rate_hz", 100.0))
+                            state.start_pose_profile(rate_hz)
                         elif mtype == "profile_stop":
                             state.stop_profile()
                         else:

@@ -349,13 +349,14 @@ class RobotGUI(QWidget):
         self.profile_rate.setDecimals(1)
         self.profile_rate.setRange(1.0, 1000.0)
         self.profile_rate.setSingleStep(10.0)
-        self.profile_rate.setValue(100.0)
+        self.profile_rate.setValue(250.0)
         self.profile_start_btn = QPushButton("Start Profile")
         self.profile_refresh_btn.clicked.connect(self.populate_profile_dropdown)
         self.profile_send_btn.clicked.connect(self.on_send_profile)
         self.profile_start_btn.clicked.connect(self.on_start_profile)
         prof_layout.addWidget(QLabel("Profile CSV:"))
         prof_layout.addWidget(self.profile_combo, 1)
+        prof_layout.addWidget(self.profile_type_combo)  # add selector next to the CSV
         prof_layout.addWidget(self.profile_refresh_btn)
         prof_layout.addWidget(self.profile_send_btn)
         prof_layout.addWidget(QLabel("Rate (Hz):"))
@@ -604,6 +605,37 @@ class RobotGUI(QWidget):
             raise ValueError("time column must be non-decreasing")
         return profile_rows
 
+    def _load_csv_as_pose_profile(self, path: str):
+        """
+        CSV rows: t, x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg
+        """
+        rows = []
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            rows = [r for r in reader if any(cell.strip() for cell in r)]
+        if not rows:
+            raise ValueError("empty CSV")
+
+        start_idx = 0
+        try:
+            float(rows[0][0])
+        except Exception:
+            start_idx = 1  # header row
+
+        prof = []
+        for r in rows[start_idx:]:
+            if len(r) < 7:
+                raise ValueError("each row must have at least 7 columns: time + x y z roll pitch yaw")
+            t = float(r[0])
+            vals = [float(x) for x in r[1:7]]
+            prof.append([t] + vals)
+
+        times = [row[0] for row in prof]
+        if any(t2 < t1 for t1, t2 in zip(times, times[1:])):
+            raise ValueError("time column must be non-decreasing")
+
+        return prof
+
     def populate_profile_dropdown(self):
         pdir = self._profiles_dir()
         csvs = sorted([f for f in os.listdir(pdir) if f.lower().endswith(".csv")])
@@ -624,20 +656,37 @@ class RobotGUI(QWidget):
         if not fname or fname.startswith("("):
             self.status_label.setText("Select a valid CSV profile")
             return
+
         path = os.path.join(self._profiles_dir(), fname)
         try:
-            profile_rows = self._load_csv_as_profile(path)
-            cmd = {"type": "profile_upload", "profile": profile_rows}
+            is_pose = (self.profile_type_combo.currentIndex() == 1)
+
+            if is_pose:
+                profile_rows = self._load_csv_as_pose_profile(path)
+                cmd = {"type": "pose_profile_upload", "profile": profile_rows}
+                self.status_label.setText(f"Sent POSE profile: {fname} ({len(profile_rows)} pts)")
+            else:
+                profile_rows = self._load_csv_as_profile(path)
+                cmd = {"type": "profile_upload", "profile": profile_rows, "units": "mm"}
+                self.status_label.setText(f"Sent AXIS profile: {fname} ({len(profile_rows)} pts)")
+
             _queue_put_latest(self.cmd_queue, cmd)
-            self.status_label.setText(f"Sent profile: {fname} ({len(profile_rows)} pts)")
+
         except Exception as e:
             self.status_label.setText(f"Profile send failed: {e}")
 
     def on_start_profile(self):
         rate = float(self.profile_rate.value())
-        cmd = {"type": "profile_start", "rate_hz": rate}
+        is_pose = (self.profile_type_combo.currentIndex() == 1)
+
+        if is_pose:
+            cmd = {"type": "pose_profile_start", "rate_hz": rate}
+            self.status_label.setText(f"Pose profile start requested at {rate:.1f} Hz")
+        else:
+            cmd = {"type": "profile_start", "rate_hz": rate}
+            self.status_label.setText(f"Axis profile start requested at {rate:.1f} Hz")
+
         _queue_put_latest(self.cmd_queue, cmd)
-        self.status_label.setText(f"Profile start requested at {rate:.1f} Hz")
 
     def _append_vec6(self, buf_list, vec):
         """Append a length-6 vector to per-axis buffers. Missing/None -> NaN."""
