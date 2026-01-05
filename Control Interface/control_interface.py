@@ -354,6 +354,8 @@ class RobotGUI(QWidget):
         self.profile_refresh_btn.clicked.connect(self.populate_profile_dropdown)
         self.profile_send_btn.clicked.connect(self.on_send_profile)
         self.profile_start_btn.clicked.connect(self.on_start_profile)
+        self.profile_type_combo = QComboBox()
+        self.profile_type_combo.addItems(["Axis Profile (mm)", "Pose Profile (XYZ mm, RPY deg)"])
         prof_layout.addWidget(QLabel("Profile CSV:"))
         prof_layout.addWidget(self.profile_combo, 1)
         prof_layout.addWidget(self.profile_type_combo)  # add selector next to the CSV
