@@ -810,7 +810,7 @@ def tcp_command_server(state: RobotState):
                                     raise ValueError("each profile row must be [t, a1..a6]")
                                 t = float(row[0])
                                 axes_mm = [float(x) for x in row[1:7]]
-                                axes_turns = _mm_to_turns(axes_mm)
+                                axes_turns = mm_to_turns(axes_mm)
                                 profile_turns.append([t] + axes_turns)
 
                             state.set_profile(profile_turns)
