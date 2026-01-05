@@ -616,18 +616,23 @@ class ODriveCANBridge(threading.Thread):
 
                 # Stream setpoints if enabled
                 if st == "enable":
-                    t_mm, q = self.state.get_hand_pose()
-                    cable_mm = pose_to_cable_lengths_m(GEOM, t_mm, q)
-                    cmd_mm = [cable_mm[i] - HOME_CABLE_MM[i] for i in range(6)]
-                    cmd_turns = mm_to_turns(cmd_mm)
+                    try:
+                        t_mm, q = self.state.get_hand_pose()
+                        cable_mm = pose_to_cable_lengths_mm(GEOM, t_mm, q)
+                        cmd_mm = [cable_mm[i] - HOME_CABLE_MM[i] for i in range(6)]
+                        cmd_turns = mm_to_turns(cmd_mm)
 
-                    for i, aid in enumerate(self.axis_ids):
-                        try:
-                            axis = self.manager.axes.get(aid)
-                            if axis is not None:
-                                axis.set_input_pos(cmd_turns[i])
-                        except Exception as e:
-                            logger.warning(f"[ODRV] axis {aid} set_input_pos failed: {e}")
+                        for i, aid in enumerate(self.axis_ids):
+                            try:
+                                axis = self.manager.axes.get(aid)
+                                if axis is not None:
+                                    axis.set_input_pos(cmd_turns[i])
+                            except Exception as e:
+                                logger.warning(f"[ODRV] axis {aid} set_input_pos failed: {e}")
+
+                    except Exception as e:
+                        # IMPORTANT: don't kill the ODrive bridge if IK/units blow up
+                        logger.error(f"[ODRV] ENABLE streaming error: {e}")
 
                 elif st == "pretension":
                     upper_N, lower_N = self.state.get_pretension()
