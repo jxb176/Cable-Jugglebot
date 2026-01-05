@@ -242,45 +242,38 @@ class RobotGUI(QWidget):
         self.status_label = QLabel("Telemetry: waiting...")
         layout.addWidget(self.status_label)
 
-        # ---- Manual Position Command (mm) ----
-        layout.addWidget(QLabel("Manual Position Command (mm)"))
+        # ---- Pose Command (global) ----
+        layout.addWidget(QLabel("Pose Command (Global): X/Y/Z (mm), Roll/Pitch (deg). Yaw assumed 0."))
 
-        man_layout = QVBoxLayout()
+        hand_row = QHBoxLayout()
 
-        # row of 6 spin boxes
-        spins_row = QHBoxLayout()
-        self.manual_spins = []
-        for i in range(6):
+        def _mk_spin(label, lo, hi, dec, step, suffix):
             col = QVBoxLayout()
-            col.addWidget(QLabel(f"A{i + 1}"))
-
+            col.addWidget(QLabel(label))
             sp = QDoubleSpinBox()
-            sp.setDecimals(2)
-            sp.setRange(-1000.0, 1000.0)
-            sp.setSingleStep(1.0)
-            sp.setValue(0.0)
-
-            # IMPORTANT: do NOT auto-send on valueChanged anymore
-            # (we only send when MOVE is pressed)
+            sp.setRange(lo, hi)
+            sp.setDecimals(dec)
+            sp.setSingleStep(step)
+            sp.setSuffix(suffix)
             col.addWidget(sp)
-            spins_row.addLayout(col)
-            self.manual_spins.append(sp)
+            hand_row.addLayout(col)
+            return sp
 
-        man_layout.addLayout(spins_row)
+        self.hand_x = _mk_spin("X", -500.0, 500.0, 2, 1.0, " mm")
+        self.hand_y = _mk_spin("Y", -500.0, 500.0, 2, 1.0, " mm")
+        self.hand_z = _mk_spin("Z", -500.0, 500.0, 2, 1.0, " mm")
+        self.hand_roll = _mk_spin("Roll", -45.0, 45.0, 2, 1.0, " deg")
+        self.hand_pitch = _mk_spin("Pitch", -45.0, 45.0, 2, 1.0, " deg")
 
-        # buttons row
-        btn_row = QHBoxLayout()
-        self.btn_move = QPushButton("MOVE")
-        self.btn_update_to_current = QPushButton("UPDATE TO CURRENT POSITION")
+        layout.addLayout(hand_row)
 
-        self.btn_move.clicked.connect(self.send_manual_move)
-        self.btn_update_to_current.clicked.connect(self.update_manual_to_current)
+        btns = QHBoxLayout()
+        self.btn_hand_send = QPushButton("Send Pose")
+        self.btn_hand_send.clicked.connect(self.send_pose)
+        btns.addWidget(self.btn_hand_pose)
 
-        btn_row.addWidget(self.btn_move)
-        btn_row.addWidget(self.btn_update_to_current)
-        man_layout.addLayout(btn_row)
-
-        layout.addLayout(man_layout)
+        btns.addStretch(1)
+        layout.addLayout(btns)
 
         # ---- Home position inputs + button ----
         home_layout = QVBoxLayout()
@@ -531,6 +524,19 @@ class RobotGUI(QWidget):
         positions = [float(sp.value()) for sp in self.axis_spins]
         cmd = {"type": "axes", "positions": positions, "units": "mm"}
         _queue_put_latest(self.cmd_queue, cmd)
+
+    def send_pose(self):
+        cmd = {
+            "type": "pose",
+            "x_mm": float(self.hand_x.value()),
+            "y_mm": float(self.hand_y.value()),
+            "z_mm": float(self.hand_z.value()),
+            "roll_deg": float(self.hand_roll.value()),
+            "pitch_deg": float(self.hand_pitch.value()),
+            # yaw is assumed 0 in the server
+        }
+        _queue_put_latest(self.cmd_queue, cmd)
+        self.status_label.setText("Sent POSE command")
 
     def send_state(self, state_value: str):
         cmd = {"type": "state", "value": state_value}

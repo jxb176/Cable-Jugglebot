@@ -66,25 +66,25 @@ def R_mul_v(R, v: Vec3) -> Vec3:
 class CableRobotGeometry:
     """
     Geometry definition for 6-cable platform.
-    - anchors_world[i]: fixed anchor point of cable i in WORLD frame (meters)
-    - attach_platform[i]: attachment point of cable i on the platform, in PLATFORM (hand) frame (meters)
+    - anchors_world[i]: fixed anchor point of cable i in WORLD frame (mm)
+    - attach_platform[i]: attachment point of cable i on the platform, in PLATFORM (hand) frame (mm)
     """
-    anchors_world = [
-        (+0.50, +0.50, +1.20),  # front-right-top
-        (+0.50, -0.50, +1.20),  # rear-right-top
-        (-0.50, +0.50, +1.20),  # front-left-top
-        (-0.50, -0.50, +1.20),  # rear-left-top
-        (+0.60, 0.00, +1.10),  # right-mid
-        (-0.60, 0.00, +1.10),  # left-mid
+    anchors_world = [           # mm, global frame
+        (+530.678, +0.00000, +445.777),  # Axis 0, Right-Top
+        (+530.678, +0.00000, -445.777),  # Axis 1, Right-Bottom
+        (-265.339, +459.581, +445.777),  # Axis 2, Back-Left-Top
+        (-265.339, +459.581, -445.777),  # Axis 3, Back-Left-Bottom
+        (-265.339, -459.581, +445.777),  # Axis 4, Front-Left-Top
+        (-265.339, -459.581, -445.777),  # Axis 5, Front-Left-Bottom
     ]
 
     attach_platform = [
-        (+0.50, +0.50, +1.20),  # front-right-top
-        (+0.50, -0.50, +1.20),  # rear-right-top
-        (-0.50, +0.50, +1.20),  # front-left-top
-        (-0.50, -0.50, +1.20),  # rear-left-top
-        (+0.60, 0.00, +1.10),  # right-mid
-        (-0.60, 0.00, +1.10),  # left-mid
+        (+57.905, +0.0000, +0.0000),  # Axis 0, Right-Top
+        (+49.384, +0.0000, -11.149),  # Axis 1, Right-Bottom
+        (-28.952, +50.147, +0.0000),  # Axis 2, Back-Left-Top
+        (-24.692, +42.768, -11.149),  # Axis 3, Back-Left-Bottom
+        (-28.952, -50.147, +0.0000),  # Axis 4, Front-Left-Top
+        (-24.692, -42.768, -11.149),  # Axis 5, Front-Left-Bottom
     ]
 
     def __post_init__(self):
@@ -94,64 +94,81 @@ class CableRobotGeometry:
 @dataclass
 class WinchCalibration:
     """
-    Converts cable length (m) to ODrive 'turns' for each axis.
-    - spool_radius_m[i]: effective spool radius for axis i (meters)
-    - gear_ratio[i]: motor_turns / spool_turn (use 1.0 if axis units are spool turns already)
+    Converts cable length (mm) to ODrive 'turns'.
+    - spool_radius_mm[i]: effective spool radius for axis i (mm)
+    - gear_ratio[i]: motor_turns / spool_turn
     - sign[i]: +1 or -1 depending on motor direction for shortening cable with +turns
-    - zero_length_m[i]: cable length (m) that corresponds to axis_turns=0.0 (your HOME reference)
+    - zero_length_mm[i]: cable length (mm) corresponding to axis_turns = 0.0
     """
-    spool_radius_m: List[float]
+    spool_radius_mm: List[float]
     gear_ratio: List[float]
     sign: List[float]
-    zero_length_m: List[float]
+    zero_length_mm: List[float]
+
 
     def __post_init__(self):
         for name, arr in [
-            ("spool_radius_m", self.spool_radius_m),
+            ("spool_radius_m", self.spool_radius_mm),
             ("gear_ratio", self.gear_ratio),
             ("sign", self.sign),
-            ("zero_length_m", self.zero_length_m),
+            ("zero_length_m", self.zero_length_mm),
         ]:
             if len(arr) != 6:
                 raise ValueError(f"{name} must have length 6.")
 
-def pose_to_cable_lengths_m(geom: CableRobotGeometry, t_world: Vec3, q_world: Quat) -> List[float]:
+def pose_to_cable_lengths_mm(
+    geom: CableRobotGeometry,
+    t_world: Vec3,   # mm
+    q_world: Quat,
+) -> List[float]:
     """
-    IK core: pose -> cable lengths (meters)
+    IK core: pose -> cable lengths (mm)
     L_i = || anchor_i - (t + R(q)*attach_i) ||
     """
     R = q_to_R(q_world)
-    lengths = []
+    lengths_mm = []
     for i in range(6):
         p_world = v_add(t_world, R_mul_v(R, geom.attach_platform[i]))
         d = v_sub(geom.anchors_world[i], p_world)
-        lengths.append(v_norm(d))
-    return lengths
+        lengths_mm.append(v_norm(d))
+    return lengths_mm
 
-def cable_lengths_to_turns(lengths_m: List[float], cal: WinchCalibration) -> List[float]:
+
+def cable_lengths_to_turns_mm(
+    lengths_mm: List[float],
+    cal: WinchCalibration,
+) -> List[float]:
     """
-    Convert length (m) to axis turns.
-    delta_turns = (L - L0) / (2*pi*r) * gear_ratio
-    axis_turns = sign * delta_turns
+    Convert cable lengths (mm) to axis turns.
     """
     turns = []
     for i in range(6):
-        r = float(cal.spool_radius_m[i])
+        r = float(cal.spool_radius_mm[i])
         if r <= 0.0:
-            raise ValueError(f"spool_radius_m[{i}] must be > 0")
-        L0 = float(cal.zero_length_m[i])
-        dL = float(lengths_m[i]) - L0
+            raise ValueError(f"spool_radius_mm[{i}] must be > 0")
+
+        L0 = float(cal.zero_length_mm[i])
+        dL = float(lengths_mm[i]) - L0
+
         spool_turns = dL / (2.0 * math.pi * r)
         motor_turns = spool_turns * float(cal.gear_ratio[i])
         turns.append(float(cal.sign[i]) * motor_turns)
+
     return turns
 
-def pose_to_axis_turns(
+
+def pose_to_axis_turns_mm(
     geom: CableRobotGeometry,
     cal: WinchCalibration,
-    t_world: Vec3,
+    t_world: Vec3,   # mm
     q_world: Quat,
 ) -> Tuple[List[float], List[float]]:
-    lengths = pose_to_cable_lengths_m(geom, t_world, q_world)
-    turns = cable_lengths_to_turns(lengths, cal)
-    return turns, lengths
+    """
+    Returns:
+      axis_turns: motor turns
+      cable_lengths_mm: absolute cable lengths in mm
+    """
+    lengths_mm = pose_to_cable_lengths_mm(geom, t_world, q_world)
+    turns = cable_lengths_to_turns_mm(lengths_mm, cal)
+    return turns, lengths_mm
+

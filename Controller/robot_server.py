@@ -9,6 +9,8 @@ from datetime import datetime
 import subprocess
 import asyncio
 from ODriveCANSimple import ODriveCanManager, AxisState  # <-- your new module
+# --- Cable IK ---
+from cable_ik import CableRobotGeometry, pose_to_cable_lengths_mm, q_from_axis_angle, q_mul, q_norm
 from typing import List, Tuple
 
 TCP_CMD_PORT = 5555
@@ -34,6 +36,30 @@ TORQUE_PER_TENSION = CAPSTAN_RADIUS_M  # Nm per N  (T = F*r)
 CONTROL_MODE_TORQUE = 1      # aka "CurrentControl" in some docs
 CONTROL_MODE_POSITION = 3
 INPUT_MODE_PASSTHROUGH = 1
+
+# Geometry (mm)
+GEOM = CableRobotGeometry()
+
+# Define the pose that corresponds to your "HOME" physical configuration
+# IMPORTANT: this must match how you physically home the platform.
+HOME_T_WORLD_MM = (0.0, 0.0, 0.0)
+HOME_ROLL_DEG = 0.0
+HOME_PITCH_DEG = 0.0
+HOME_YAW_DEG = 0.0  # fixed assumption
+
+def quat_from_rpy_deg(roll_deg: float, pitch_deg: float, yaw_deg: float = 0.0):
+    """Quaternion for R = Rz(yaw)*Ry(pitch)*Rx(roll)."""
+    r = math.radians(float(roll_deg))
+    p = math.radians(float(pitch_deg))
+    y = math.radians(float(yaw_deg))
+    qx = q_from_axis_angle((1.0, 0.0, 0.0), r)
+    qy = q_from_axis_angle((0.0, 1.0, 0.0), p)
+    qz = q_from_axis_angle((0.0, 0.0, 1.0), y)
+    return q_norm(q_mul(q_mul(qz, qy), qx))
+
+# Precompute "home" geometric cable lengths in mm (used to convert absolute lengths -> delta lengths)
+HOME_Q = quat_from_rpy_deg(HOME_ROLL_DEG, HOME_PITCH_DEG, HOME_YAW_DEG)
+HOME_CABLE_MM = pose_to_cable_lengths_mm(GEOM, HOME_T_WORLD_MM, HOME_Q)  # returns mm given your mm geometry
 
 def mm_to_turns(mm_list):
     """Convert [mm] -> [turns] elementwise using MM_PER_TURN."""
@@ -176,6 +202,25 @@ class RobotState:
         self.pret_upper_N = 0.0
         self.pret_lower_N = 0.0
         self.pret_version = 0
+        # --- Hand (platform) command in global coordinates (mm + quaternion) ---
+        self.hand_t_mm = (0.0, 0.0, 0.0)
+        self.hand_q = (1.0, 0.0, 0.0, 0.0)
+        self.hand_version = 0
+
+    def set_hand_pose(self, t_mm, q):
+        # t_mm: (x,y,z) in mm, q: quaternion (w,x,y,z)
+        with self.lock:
+            self.hand_t_mm = (float(t_mm[0]), float(t_mm[1]), float(t_mm[2]))
+            self.hand_q = q_norm((float(q[0]), float(q[1]), float(q[2]), float(q[3])))
+            self.hand_version += 1
+
+    def get_hand_pose(self):
+        with self.lock:
+            return self.hand_t_mm, self.hand_q
+
+    def get_hand_version(self):
+        with self.lock:
+            return int(self.hand_version)
 
     def set_controller_ip(self, ip):
         with self.lock:
@@ -570,15 +615,19 @@ class ODriveCANBridge(threading.Thread):
 
                 # Stream setpoints if enabled
                 if st == "enable":
-                    pos_cmd_mm = self.state.get_pos_cmd()  # mm
-                    pos_cmd_turns = mm_to_turns(pos_cmd_mm)  # turns for ODrive
+                    t_mm, q = self.state.get_hand_pose()
+                    cable_mm = pose_to_cable_lengths_m(GEOM, t_mm, q)
+                    cmd_mm = [cable_mm[i] - HOME_CABLE_MM[i] for i in range(6)]
+                    cmd_turns = mm_to_turns(cmd_mm)
+
                     for i, aid in enumerate(self.axis_ids):
                         try:
                             axis = self.manager.axes.get(aid)
                             if axis is not None:
-                                axis.set_input_pos(pos_cmd_turns[i])
+                                axis.set_input_pos(cmd_turns[i])
                         except Exception as e:
                             logger.warning(f"[ODRV] axis {aid} set_input_pos failed: {e}")
+
                 elif st == "pretension":
                     upper_N, lower_N = self.state.get_pretension()
 
@@ -800,6 +849,15 @@ def tcp_command_server(state: RobotState):
                         elif mtype == "home":
                             home_mm = _coerce_vec6_to_mm(msg, "home_pos")
                             state.request_home(home_mm)
+                        elif mtype == "pose":
+                            x = float(msg.get("x_mm", 0.0))
+                            y = float(msg.get("y_mm", 0.0))
+                            z = float(msg.get("z_mm", 0.0))
+                            roll = float(msg.get("roll_deg", 0.0))
+                            pitch = float(msg.get("pitch_deg", 0.0))
+
+                            q = quat_from_rpy_deg(roll, pitch, 0.0)  # yaw assumed 0
+                            state.set_hand_pose((x, y, z), q)
                         elif mtype == "profile_upload":
                             profile = msg.get("profile", [])
                             units = (msg.get("units") or "mm").lower()
