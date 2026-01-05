@@ -270,7 +270,7 @@ class RobotGUI(QWidget):
         btns = QHBoxLayout()
         self.btn_hand_send = QPushButton("Send Pose")
         self.btn_hand_send.clicked.connect(self.send_pose)
-        btns.addWidget(self.btn_hand_pose)
+        btns.addWidget(self.btn_hand_send)
 
         btns.addStretch(1)
         layout.addLayout(btns)
