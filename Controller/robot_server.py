@@ -801,19 +801,26 @@ def tcp_command_server(state: RobotState):
                             home_mm = _coerce_vec6_to_mm(msg, "home_pos")
                             state.request_home(home_mm)
                         elif mtype == "profile_upload":
-                            profile_mm = msg.get("profile", [])
+                            profile = msg.get("profile", [])
+                            units = (msg.get("units") or "mm").lower()
 
-                            # Convert each row: [t, a1..a6] where a1..a6 are mm -> turns
-                            profile_turns = []
-                            for row in profile_mm:
-                                if not isinstance(row, (list, tuple)) or len(row) < 7:
-                                    raise ValueError("each profile row must be [t, a1..a6]")
-                                t = float(row[0])
-                                axes_mm = [float(x) for x in row[1:7]]
-                                axes_turns = mm_to_turns(axes_mm)
-                                profile_turns.append([t] + axes_turns)
+                            if units == "mm":
+                                profile_mm = profile
+                            elif units == "turns":
+                                # allow legacy profiles in turns
+                                profile_mm = []
+                                for row in profile:
+                                    if not isinstance(row, (list, tuple)) or len(row) < 7:
+                                        raise ValueError("each profile row must be [t, a1..a6]")
+                                    t = float(row[0])
+                                    axes_turns = [float(x) for x in row[1:7]]
+                                    axes_mm = turns_to_mm(axes_turns)
+                                    profile_mm.append([t] + axes_mm)
+                            else:
+                                raise ValueError(f"Unknown units '{units}' (expected 'mm' or 'turns')")
 
-                            state.set_profile(profile_turns)
+                            # Store profile in mm (RobotState / ProfilePlayer operate in mm)
+                            state.set_profile(profile_mm)
                         elif mtype == "profile_start":
                             rate_hz = float(msg.get("rate_hz", 100.0))
                             state.start_profile(rate_hz)
