@@ -8,6 +8,7 @@
 * TODO: Flag for success (position/velocity tolerance met)
 * TODO: Option to constrain start or end point when segment length can't be met
 * TODO: Add a0 and a1 input to allow for non-zero start/end acceleration, default to 0 in the class if not defined
+* Future update: Scale trajectory primatives to allow N DoF, building with 3 for now as that's what Jugglebot needs, angles will be handled differently
 ### Path Planner
 * Juggling Pattern Generator - Catch/Throw sequences, positions, timing
 * Feasibility and optimiziation will happen at this layer
