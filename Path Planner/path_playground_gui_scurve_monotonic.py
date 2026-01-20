@@ -31,19 +31,6 @@ import pyqtgraph as pg
 
 
 # ------------------------------------------------------------
-# Envelope model (Z-only for now)
-# ------------------------------------------------------------
-class WorkEnvelope:
-    def __init__(self, z_min: float, z_max: float, margin: float = 0.0):
-        self.z_min = float(z_min)
-        self.z_max = float(z_max)
-        self.margin = float(margin)
-
-    def contains_z(self, z: float) -> bool:
-        return (self.z_min + self.margin) <= z <= (self.z_max - self.margin)
-
-
-# ------------------------------------------------------------
 # Helpers: exact integration under constant jerk
 # State is (p, v, a)
 # ------------------------------------------------------------
@@ -280,41 +267,42 @@ def generate_z_profile_monotonic_to_vz1(
     vz0: float,
     vz1: float,
     vmax: float,
-    amax_z: float,
-    jmax_z: float,
+    a_ref_z: float,
+    j_ref_z: float,
     sample_hz: float,
     auto_increase_jerk: bool = True,
-    jerk_growth: float = 1.5,
+    auto_increase_accel: bool = False,
+    growth: float = 1.5,
+    accel_max_cap: float = 1e9,
     jerk_max_cap: float = 1e9,
 ) -> tuple["np.ndarray", dict]:
     """Monotonic (no overshoot) dv-based Z primitive with **no constant-velocity coast**.
 
     Assumes dz = z1 - z0 != 0 and enforces monotonic motion along that line.
 
-    Steps:
-      1) Build the min-time jerk/accel-limited dv-transition vz0->vz1 with a(0)=a(T)=0.
-         This yields a velocity that moves monotonically toward vz1.
-      2) If that min-time dv-transition travels less distance than dz, time-scale it by s>=1
-         so that displacement matches dz exactly. Time scaling reduces dynamics:
-             a_peak -> a_peak/s
-             j_peak -> j_peak/s^2
+    Core idea (single scaling factor):
+      - Build the *min-time* jerk/accel-limited dv-transition vz0->vz1 with a(0)=a(T)=0.
+      - Choose a single scalar k to scale BOTH reference limits:
+            a_ref_eff = a_ref_z * k
+            j_ref_eff = j_ref_z * k
+        such that the min-time dv-transition displacement equals dz exactly.
 
-    Feasibility:
-      - If the min-time dv-transition displacement magnitude exceeds |dz|, then dz is too
-        short for the requested dv under the current jerk/accel limits. If
-        auto_increase_jerk=True, we increase jerk until it fits (or until jerk_max_cap).
+    This removes the need for a separate "feasibility scale" + "time_scale".
+    Reducing k makes the transition slower (larger displacement). Increasing k makes it
+    faster (smaller displacement). For dz that is "too short" at k=1, we require
+    auto-increase to be enabled to allow k>1.
 
     Returns a 13-col trajectory array compatible with the existing GUI:
       columns: [t, x,y,z, vx,vy,vz, ax,ay,az, jx,jy,jz] (only z/vz/az/jz filled).
     """
     if sample_hz <= 0:
         raise ValueError("sample_hz must be > 0")
-    if vmax <= 0 or amax_z <= 0 or jmax_z <= 0:
-        raise ValueError("vmax, amax_z, jmax_z must be > 0")
+    if vmax <= 0 or a_ref_z <= 0 or j_ref_z <= 0:
+        raise ValueError("vmax, a_ref_z, j_ref_z must be > 0")
 
     z0 = float(z0); z1 = float(z1)
     vz0 = float(vz0); vz1 = float(vz1)
-    vmax = float(vmax); amax_z = float(amax_z); jmax_z = float(jmax_z)
+    vmax = float(vmax); a_ref_z = float(a_ref_z); j_ref_z = float(j_ref_z)
 
     if abs(vz0) - vmax > 1e-9 or abs(vz1) - vmax > 1e-9:
         raise ValueError("|vz0| or |vz1| exceed v_max")
@@ -331,31 +319,22 @@ def generate_z_profile_monotonic_to_vz1(
 
     dt = 1.0 / float(sample_hz)
 
-    def build_for_jerk(j_try: float):
-        d_base, t_base, segs_base = _phase_distance_time(vz0, vz1, amax_z, j_try)
+    def d_for_k(k: float) -> float:
+        d_tmp, _, _ = _phase_distance_time(vz0, vz1, a_ref_z * k, j_ref_z * k)
+        return float(d_tmp)
+
+    def build_for_k(k: float):
+        a_try = a_ref_z * float(k)
+        j_try = j_ref_z * float(k)
+        d_base, t_base, segs = _phase_distance_time(vz0, vz1, a_try, j_try)
 
         # Require dv-phase displacement in the same direction as dz
         if dz * d_base < -1e-9:
             return None, "dv-transition displacement has opposite sign to dz"
-
-        # Overshoot: min-time dv transition already travels too far
-        if abs(d_base) > abs(dz) + 1e-9:
-            return None, f"min-time dv transition overshoots |dz| (|d_base|={abs(d_base):.6g} > |dz|={abs(dz):.6g})"
-
         if abs(d_base) < 1e-15:
             return None, "degenerate dv displacement (d_base≈0)"
 
-        # Time-scale factor to hit dz exactly (>=1)
-        s = dz / d_base
-        if s < 1.0 - 1e-9:
-            # should be redundant with overshoot, but keep robust
-            return None, f"would require time-scale s<1 (s={s:.6g})"
-        s = max(1.0, float(s))
-
-        # Apply time scaling: durations stretch by s, jerk magnitudes shrink by 1/s^2.
-        segments = [(j / (s * s), dur * s) for (j, dur) in segs_base]
-
-        samples = _simulate_segments(segments, p0=z0, v0=vz0, a0=0.0, dt=dt)
+        samples = _simulate_segments(segs, p0=z0, v0=vz0, a0=0.0, dt=dt)
         if samples.shape[0] == 0:
             return None, "degenerate profile"
 
@@ -374,8 +353,9 @@ def generate_z_profile_monotonic_to_vz1(
             "mode": "monotonic_to_vz1_no_coast",
             "t_total": float(traj[-1, 0]),
             "t_base": float(t_base),
-            "time_scale": float(s),
-            "j_limit_used": float(j_try),
+            "k_used": float(k),
+            "a_ref_used": float(a_try),
+            "j_ref_used": float(j_try),
             "a_effective_peak": float(np.max(np.abs(traj[:, 9]))),
             "j_effective_peak": float(np.max(np.abs(traj[:, 12]))),
             "d_base": float(d_base),
@@ -383,144 +363,97 @@ def generate_z_profile_monotonic_to_vz1(
         }
         return traj, info
 
-    j_used = jmax_z
-    traj, info = build_for_jerk(j_used)
+    dz_abs = abs(dz)
+    tol_abs = max(1e-10, 1e-8 * dz_abs)
 
-    if traj is None and auto_increase_jerk:
-        # Increase jerk until min-time dv distance fits within dz.
+    # Evaluate at k=1
+    k0 = 1.0
+    d0 = d_for_k(k0)
+    if dz * d0 < -1e-9:
+        raise ValueError("dv-transition displacement has opposite sign to dz")
+
+    # If already close enough, build directly
+    if abs(abs(d0) - dz_abs) <= tol_abs:
+        traj, info = build_for_k(k0)
+        if traj is None:
+            raise ValueError("Degenerate profile at k=1.0: " + str(info))
+        return traj, info
+
+    # Determine if we need k>1 (shorter dz) or k<1 (longer dz)
+    if abs(d0) > dz_abs + tol_abs:
+        # Need to increase k to reduce |d|
+        if not (auto_increase_jerk or auto_increase_accel):
+            raise ValueError(
+                "Infeasible (dz too short) under current refs and auto-increase disabled. "
+                f"|d_base(k=1)|={abs(d0):.6g} > |dz|={dz_abs:.6g}"
+            )
+
+        # Cap on k based on enabled auto-increase options
+        k_cap = 1e30
+        if auto_increase_accel:
+            k_cap = min(k_cap, accel_max_cap / a_ref_z)
+        if auto_increase_jerk:
+            k_cap = min(k_cap, jerk_max_cap / j_ref_z)
+
+        k_lo = k0
+        k_hi = k0
+        d_hi = d0
         for _ in range(80):
-            j_used = min(j_used * jerk_growth, jerk_max_cap)
-            traj, info = build_for_jerk(j_used)
-            if traj is not None:
+            if k_hi >= k_cap - 1e-12:
                 break
-            if j_used >= jerk_max_cap - 1e-9:
+            k_hi = min(k_hi * float(growth), k_cap)
+            d_hi = d_for_k(k_hi)
+            if abs(d_hi) <= dz_abs + tol_abs:
                 break
 
+        if abs(d_hi) > dz_abs + tol_abs:
+            raise ValueError(
+                "Infeasible even after increasing refs up to caps. "
+                f"|d_base(k_cap={k_hi:.6g})|={abs(d_hi):.6g} still > |dz|={dz_abs:.6g}"
+            )
+
+    else:
+        # Need to decrease k to increase |d| (always allowed)
+        k_hi = k0
+        k_lo = k0
+        d_lo = d0
+        for _ in range(80):
+            k_lo = k_lo / float(growth)
+            d_lo = d_for_k(k_lo)
+            if abs(d_lo) >= dz_abs - tol_abs:
+                break
+            if k_lo < 1e-12:
+                break
+
+        if abs(d_lo) < dz_abs - tol_abs:
+            raise ValueError(
+                "Could not increase displacement enough by reducing k. "
+                f"|d_base(k={k_lo:.6g})|={abs(d_lo):.6g} < |dz|={dz_abs:.6g}"
+            )
+
+    # Bisection solve k in [k_lo, k_hi] for |d(k)| == |dz|
+    for _ in range(80):
+        k_mid = 0.5 * (k_lo + k_hi)
+        d_mid = d_for_k(k_mid)
+        if abs(abs(d_mid) - dz_abs) <= tol_abs:
+            k_lo = k_hi = k_mid
+            break
+        # If |d_mid| too big, increase k
+        if abs(d_mid) > dz_abs:
+            k_lo = k_mid
+        else:
+            k_hi = k_mid
+
+    k_used = 0.5 * (k_lo + k_hi)
+    traj, info = build_for_k(k_used)
     if traj is None:
         reason = info if isinstance(info, str) else str(info)
         raise ValueError(
-            "Infeasible monotonic no-coast profile with given limits. "
+            "Infeasible monotonic no-coast profile with given reference limits. "
             + reason
-            + ". Try increasing jerk/accel limits, increasing |z1-z0|, or relaxing endpoint velocities."
+            + ". Try increasing accel_ref/jerk_ref, increasing |z1-z0|, or relaxing endpoint velocities."
         )
 
-    return traj, info
-
-
-# ------------------------------------------------------------
-# dz == 0 special case: return to same position while changing velocity
-# ------------------------------------------------------------
-def generate_z_profile_same_position(
-    z0: float,
-    vz0: float,
-    vz1: float,
-    vmax: float,
-    amax_z: float,
-    jmax_z: float,
-    sample_hz: float,
-) -> Tuple[np.ndarray, dict]:
-    """
-    Generate a Z trajectory that starts at z0 with vz0 and ends at z0 with vz1,
-    under |vz|<=vmax, |az|<=amax_z, |jz|<=jmax_z.
-
-    Structure:
-      vz0 -> v_peak (min-time)
-      optional cruise at v_peak
-      v_peak -> vz1 (min-time)
-    Solve v_peak and cruise such that net displacement == 0.
-    """
-    if sample_hz <= 0:
-        raise ValueError("sample_hz must be > 0")
-    if vmax <= 0 or amax_z <= 0 or jmax_z <= 0:
-        raise ValueError("vmax, amax_z, jmax_z must be > 0")
-    if abs(vz0) - vmax > 1e-9 or abs(vz1) - vmax > 1e-9:
-        raise ValueError("|vz0| or |vz1| exceed v_max")
-
-    vmin = -float(vmax)
-    vmax = float(vmax)
-
-    def d_min_for_peak(v_peak: float) -> float:
-        d1, _, _ = _phase_distance_time(vz0, v_peak, amax_z, jmax_z)
-        d2, _, _ = _phase_distance_time(v_peak, vz1, amax_z, jmax_z)
-        return d1 + d2
-
-    # Find a root (if any) for d_min_for_peak(v_peak) == 0 (no cruise)
-    xs = np.linspace(vmin, vmax, 801)
-    ds = np.array([d_min_for_peak(x) for x in xs], dtype=float)
-
-    bracket = None
-    for i in range(len(xs) - 1):
-        if ds[i] == 0.0:
-            bracket = (xs[i], xs[i])
-            break
-        if ds[i] * ds[i + 1] < 0:
-            bracket = (xs[i], xs[i + 1])
-            break
-
-    if bracket is not None and bracket[0] != bracket[1]:
-        lo, hi = float(bracket[0]), float(bracket[1])
-        dlo = d_min_for_peak(lo)
-        for _ in range(100):
-            mid = 0.5 * (lo + hi)
-            dmid = d_min_for_peak(mid)
-            if abs(dmid) < 1e-12:
-                lo = hi = mid
-                break
-            if dlo * dmid <= 0:
-                hi = mid
-            else:
-                lo = mid
-                dlo = dmid
-        v_peak = 0.5 * (lo + hi)
-        t_cruise = 0.0
-        mode = "dz0_no_cruise"
-    else:
-        # Use cruise to cancel displacement: d_min + v_peak*t = 0
-        # choose a nonzero bound v_peak that yields a nonnegative cruise time
-        candidates = []
-        for v_peak_try in (vmin, vmax):
-            if abs(v_peak_try) < 1e-12:
-                continue
-            dmin = d_min_for_peak(v_peak_try)
-            t = -dmin / v_peak_try
-            if t >= -1e-12:  # allow tiny negative numeric
-                candidates.append((max(0.0, t), v_peak_try, dmin))
-        if not candidates:
-            raise ValueError("Infeasible dz=0 profile with given limits; try increasing v_max/amax/jmax")
-        t_cruise, v_peak, _ = min(candidates, key=lambda x: x[0])
-        mode = "dz0_with_cruise"
-
-    segs1 = _build_min_time_dv_segments(vz0, v_peak, amax_z, jmax_z)
-    segs2 = _build_min_time_dv_segments(v_peak, vz1, amax_z, jmax_z)
-
-    segments: List[Tuple[float, float]] = []
-    segments.extend(segs1)
-    if t_cruise > 0:
-        segments.append((0.0, t_cruise))
-    segments.extend(segs2)
-
-    dt = 1.0 / float(sample_hz)
-    samples = _simulate_segments(segments, p0=z0, v0=vz0, a0=0.0, dt=dt)
-    if samples.shape[0] == 0:
-        raise ValueError("Degenerate dz=0 profile")
-
-    # tiny correction to land exactly at z0 (usually ~1e-15)
-    z_end = samples[-1, 1]
-    samples[:, 1] += (z0 - z_end)
-
-    traj = np.zeros((samples.shape[0], 13), dtype=float)
-    traj[:, 0] = samples[:, 0]
-    traj[:, 3] = samples[:, 1]
-    traj[:, 6] = samples[:, 2]
-    traj[:, 9] = samples[:, 3]
-    traj[:, 12] = samples[:, 4]
-
-    info = {
-        "mode": mode,
-        "t_total": float(traj[-1, 0]),
-        "v_peak": float(v_peak),
-        "t_cruise": float(t_cruise),
-    }
     return traj, info
 
 
@@ -568,47 +501,34 @@ class ScurvePlayground(QWidget):
         self.monotonic.setChecked(True)
         g.addWidget(self.monotonic, row, 0, 1, 2); row += 1
 
-        self.auto_jerk = QCheckBox("Auto-increase jerk if infeasible")
+        self.auto_jerk = QCheckBox("Auto-increase jerk_ref if infeasible")
         self.auto_jerk.setChecked(True)
         g.addWidget(self.auto_jerk, row, 0, 1, 2); row += 1
+
+        self.auto_accel = QCheckBox("Auto-increase accel_ref if infeasible")
+        self.auto_accel.setChecked(False)
+        g.addWidget(self.auto_accel, row, 0, 1, 2); row += 1
+
+        g.addWidget(QLabel("Feasibility growth"), row, 0)
+        self.feas_growth = QDoubleSpinBox(); self.feas_growth.setRange(1.01, 10.0); self.feas_growth.setDecimals(3); self.feas_growth.setValue(1.5)
+        g.addWidget(self.feas_growth, row, 1); row += 1
 
         # ---- Limits ----
         lg = QGroupBox("Limits")
         left.addWidget(lg)
         lgd = QGridLayout(lg)
 
-        lgd.addWidget(QLabel("amax_z [m/s²]"), 0, 0)
+        lgd.addWidget(QLabel("a_ref_z [m/s²]"), 0, 0)
         self.amax = QDoubleSpinBox(); self.amax.setRange(0.01, 1e6); self.amax.setDecimals(3); self.amax.setValue(50.0)
         lgd.addWidget(self.amax, 0, 1)
 
-        lgd.addWidget(QLabel("jmax_z [m/s³]"), 1, 0)
+        lgd.addWidget(QLabel("j_ref_z [m/s³]"), 1, 0)
         self.jmax = QDoubleSpinBox(); self.jmax.setRange(0.01, 1e6); self.jmax.setDecimals(3); self.jmax.setValue(200.0)
         lgd.addWidget(self.jmax, 1, 1)
 
         lgd.addWidget(QLabel("Sample Hz"), 2, 0)
         self.sample_hz = QDoubleSpinBox(); self.sample_hz.setRange(10, 2000); self.sample_hz.setValue(200)
         lgd.addWidget(self.sample_hz, 2, 1)
-
-        # ---- Envelope ----
-        eg = QGroupBox("Envelope (Z)")
-        left.addWidget(eg)
-        egd = QGridLayout(eg)
-
-        self.env_enable = QCheckBox("Enable envelope")
-        self.env_enable.setChecked(True)
-        egd.addWidget(self.env_enable, 0, 0, 1, 2)
-
-        egd.addWidget(QLabel("z_min [m]"), 1, 0)
-        self.zmin = QDoubleSpinBox(); self.zmin.setRange(-10, 10); self.zmin.setValue(-0.5)
-        egd.addWidget(self.zmin, 1, 1)
-
-        egd.addWidget(QLabel("z_max [m]"), 2, 0)
-        self.zmax = QDoubleSpinBox(); self.zmax.setRange(-10, 10); self.zmax.setValue(0.5)
-        egd.addWidget(self.zmax, 2, 1)
-
-        egd.addWidget(QLabel("margin [m]"), 3, 0)
-        self.margin = QDoubleSpinBox(); self.margin.setRange(0, 1); self.margin.setDecimals(4); self.margin.setValue(0.0)
-        egd.addWidget(self.margin, 3, 1)
 
         # Buttons
         self.btn_run = QPushButton("Generate")
@@ -644,15 +564,9 @@ class ScurvePlayground(QWidget):
             vz0 = float(self.vz0.value())
             vz1 = float(self.vz1.value())
             vmax = float(self.vmax.value())
-            amax_z = float(self.amax.value())
-            jmax_z = float(self.jmax.value())
+            a_ref_z = float(self.amax.value())
+            j_ref_z = float(self.jmax.value())
             sample_hz = float(self.sample_hz.value())
-
-            env = None
-            if self.env_enable.isChecked():
-                env = WorkEnvelope(self.zmin.value(), self.zmax.value(), self.margin.value())
-                if not env.contains_z(z0) or not env.contains_z(z1):
-                    raise ValueError("Z endpoints violate envelope")
 
             dz = z1 - z0
             D = abs(dz)
@@ -663,9 +577,11 @@ class ScurvePlayground(QWidget):
             if self.monotonic.isChecked():
                 traj, info = generate_z_profile_monotonic_to_vz1(
                     z0=z0, z1=z1, vz0=vz0, vz1=vz1,
-                    vmax=vmax, amax_z=amax_z, jmax_z=jmax_z,
+                    vmax=vmax, a_ref_z=a_ref_z, j_ref_z=j_ref_z,
                     sample_hz=sample_hz,
                     auto_increase_jerk=self.auto_jerk.isChecked(),
+                    auto_increase_accel=self.auto_accel.isChecked(),
+                    growth=float(self.feas_growth.value()),
                 )
             else:
                 # Legacy: normalized s(t) with possible interior peak speed
@@ -675,8 +591,8 @@ class ScurvePlayground(QWidget):
 
                 # bounds in s-space use magnitude scaling by |dz|
                 sdot_max = abs(vmax) / D
-                amax_s = amax_z / D
-                jmax_s = jmax_z / D
+                amax_s = a_ref_z / D
+                jmax_s = j_ref_z / D
 
                 sc, info = generate_scurve_normalized_with_vbounds(
                     sdot0=sdot0, sdot1=sdot1,
@@ -685,11 +601,6 @@ class ScurvePlayground(QWidget):
                     sample_hz=sample_hz
                 )
                 traj = map_scurve_to_z(sc, z0, z1)
-
-            # envelope check over trajectory
-            if env is not None:
-                if np.any(traj[:, 3] < env.z_min + env.margin) or np.any(traj[:, 3] > env.z_max - env.margin):
-                    raise ValueError("Generated trajectory violates envelope")
 
             self.last_traj = traj
             self.update_plots(traj)
@@ -709,10 +620,11 @@ class ScurvePlayground(QWidget):
                     self.status.setText(
                         f"Mode: {mode}\n"
                         f"T_total: {info.get('t_total', 0.0):.6f} s\n"
-                        f"time_scale: {info.get('time_scale', 1.0):.6f} (>=1 slows dynamics)\n"
+                        f"k_used: {info.get('k_used', 1.0):.6f} (scales accel_ref & jerk_ref)\n"
                         f"a_peak: {info.get('a_effective_peak', 0.0):.6f} m/s^2\n"
                         f"j_peak: {info.get('j_effective_peak', 0.0):.6f} m/s^3\n"
-                        f"j_limit_used: {info.get('j_limit_used', 0.0):.6f} m/s^3"
+                        f"a_ref_used: {info.get('a_ref_used', 0.0):.6f} m/s^2\n"
+                        f"j_ref_used: {info.get('j_ref_used', 0.0):.6f} m/s^3"
                     )
                 else:
                     self.status.setText(
