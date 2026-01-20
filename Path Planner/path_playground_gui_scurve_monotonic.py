@@ -286,18 +286,26 @@ def generate_z_profile_monotonic_to_vz1(
     auto_increase_jerk: bool = True,
     jerk_growth: float = 1.5,
     jerk_max_cap: float = 1e9,
-) -> Tuple[np.ndarray, dict]:
-    """Generate a dz != 0 trajectory whose velocity approaches vz1 monotonically.
+) -> tuple["np.ndarray", dict]:
+    """Monotonic (no overshoot) dv-based Z primitive with **no constant-velocity coast**.
 
-    Guarantees:
-      - v(t) never crosses vz1 early and returns (no overshoot).
-      - a(t) keeps a single sign over the dv-transition (accel OR decel).
+    Assumes dz = z1 - z0 != 0 and enforces monotonic motion along that line.
 
-    Notes:
-      - Requires vz1 != 0 if cruise is needed. If vz1 == 0, feasibility requires
-        dz equals the dv-transition displacement (within tolerance).
-      - If auto_increase_jerk=True and the dv-transition doesn't fit, jerk is
-        increased until it does (or until jerk_max_cap).
+    Steps:
+      1) Build the min-time jerk/accel-limited dv-transition vz0->vz1 with a(0)=a(T)=0.
+         This yields a velocity that moves monotonically toward vz1.
+      2) If that min-time dv-transition travels less distance than dz, time-scale it by s>=1
+         so that displacement matches dz exactly. Time scaling reduces dynamics:
+             a_peak -> a_peak/s
+             j_peak -> j_peak/s^2
+
+    Feasibility:
+      - If the min-time dv-transition displacement magnitude exceeds |dz|, then dz is too
+        short for the requested dv under the current jerk/accel limits. If
+        auto_increase_jerk=True, we increase jerk until it fits (or until jerk_max_cap).
+
+    Returns a 13-col trajectory array compatible with the existing GUI:
+      columns: [t, x,y,z, vx,vy,vz, ax,ay,az, jx,jy,jz] (only z/vz/az/jz filled).
     """
     if sample_hz <= 0:
         raise ValueError("sample_hz must be > 0")
@@ -313,44 +321,45 @@ def generate_z_profile_monotonic_to_vz1(
 
     dz = z1 - z0
     if abs(dz) < 1e-12:
-        raise ValueError("generate_z_profile_monotonic_to_vz1 is for dz != 0")
+        raise ValueError("This primitive requires z0 != z1 (dz != 0)")
 
-    # Feasibility direction sanity: if vz1 is exactly zero, you can only finish with
-    # dz equal to the dv-phase displacement (can't cruise at v=0).
-    # Otherwise we can use cruise at vz1 to make up remaining distance.
+    # Basic monotonic-motion sanity (avoids silent direction reversal)
+    if dz > 0 and (vz0 + vz1) < -1e-9:
+        raise ValueError("dz>0 but endpoint velocities imply net -z motion; monotonic motion would be violated")
+    if dz < 0 and (vz0 + vz1) > 1e-9:
+        raise ValueError("dz<0 but endpoint velocities imply net +z motion; monotonic motion would be violated")
 
-    j_used = jmax_z
-    last_reason = ""
+    dt = 1.0 / float(sample_hz)
 
-    def try_build(j_try: float):
-        d_dv, t_dv, segs_dv = _phase_distance_time(vz0, vz1, amax_z, j_try)
-        # remaining displacement to be handled by cruise at vz1
-        d_rem = dz - d_dv
+    def build_for_jerk(j_try: float):
+        d_base, t_base, segs_base = _phase_distance_time(vz0, vz1, amax_z, j_try)
 
-        if abs(vz1) < 1e-12:
-            # Need d_rem ~ 0 (no cruise possible)
-            if abs(d_rem) > 1e-9:
-                return None, f"vz1≈0 so dz must match dv displacement; |dz-d_dv|={abs(d_rem):.3e}"
-            t_cruise = 0.0
-        else:
-            t_cruise = d_rem / vz1
-            # Cruise time must be nonnegative; if negative, the dv-transition alone
-            # already overshoots the required displacement.
-            if t_cruise < -1e-12:
-                return None, f"dv-transition overshoots dz (t_cruise={t_cruise:.3e})"
-            t_cruise = max(0.0, t_cruise)
+        # Require dv-phase displacement in the same direction as dz
+        if dz * d_base < -1e-9:
+            return None, "dv-transition displacement has opposite sign to dz"
 
-        # Build segments: dv phase then optional cruise
-        segments = list(segs_dv)
-        if t_cruise > 0:
-            segments.append((0.0, t_cruise))
+        # Overshoot: min-time dv transition already travels too far
+        if abs(d_base) > abs(dz) + 1e-9:
+            return None, f"min-time dv transition overshoots |dz| (|d_base|={abs(d_base):.6g} > |dz|={abs(dz):.6g})"
 
-        dt = 1.0 / float(sample_hz)
+        if abs(d_base) < 1e-15:
+            return None, "degenerate dv displacement (d_base≈0)"
+
+        # Time-scale factor to hit dz exactly (>=1)
+        s = dz / d_base
+        if s < 1.0 - 1e-9:
+            # should be redundant with overshoot, but keep robust
+            return None, f"would require time-scale s<1 (s={s:.6g})"
+        s = max(1.0, float(s))
+
+        # Apply time scaling: durations stretch by s, jerk magnitudes shrink by 1/s^2.
+        segments = [(j / (s * s), dur * s) for (j, dur) in segs_base]
+
         samples = _simulate_segments(segments, p0=z0, v0=vz0, a0=0.0, dt=dt)
         if samples.shape[0] == 0:
             return None, "degenerate profile"
 
-        # Tiny correction to land exactly at z1 (numerical). Keep v/a/j as-is.
+        # Numerical correction to land exactly at z1
         z_end = samples[-1, 1]
         samples[:, 1] += (z1 - z_end)
 
@@ -362,23 +371,26 @@ def generate_z_profile_monotonic_to_vz1(
         traj[:, 12] = samples[:, 4]
 
         info = {
-            "mode": "monotonic_to_vz1",
+            "mode": "monotonic_to_vz1_no_coast",
             "t_total": float(traj[-1, 0]),
-            "t_dv": float(t_dv),
-            "t_cruise": float(t_cruise),
-            "j_used": float(j_try),
-            "d_dv": float(d_dv),
-            "d_rem": float(d_rem),
+            "t_base": float(t_base),
+            "time_scale": float(s),
+            "j_limit_used": float(j_try),
+            "a_effective_peak": float(np.max(np.abs(traj[:, 9]))),
+            "j_effective_peak": float(np.max(np.abs(traj[:, 12]))),
+            "d_base": float(d_base),
+            "dz": float(dz),
         }
         return traj, info
 
-    traj, info = try_build(j_used)
+    j_used = jmax_z
+    traj, info = build_for_jerk(j_used)
+
     if traj is None and auto_increase_jerk:
-        # Increase jerk until dv displacement fits into dz (no negative cruise), or cap.
+        # Increase jerk until min-time dv distance fits within dz.
         for _ in range(80):
-            last_reason = info  # type: ignore
             j_used = min(j_used * jerk_growth, jerk_max_cap)
-            traj, info = try_build(j_used)
+            traj, info = build_for_jerk(j_used)
             if traj is not None:
                 break
             if j_used >= jerk_max_cap - 1e-9:
@@ -387,12 +399,14 @@ def generate_z_profile_monotonic_to_vz1(
     if traj is None:
         reason = info if isinstance(info, str) else str(info)
         raise ValueError(
-            "Infeasible monotonic profile with given limits. "
+            "Infeasible monotonic no-coast profile with given limits. "
             + reason
-            + ". Try increasing jerk/accel limits, increasing |z1-z0|, or allowing non-monotonic motion."
+            + ". Try increasing jerk/accel limits, increasing |z1-z0|, or relaxing endpoint velocities."
         )
 
     return traj, info
+
+
 # ------------------------------------------------------------
 # dz == 0 special case: return to same position while changing velocity
 # ------------------------------------------------------------
@@ -642,41 +656,35 @@ class ScurvePlayground(QWidget):
 
             dz = z1 - z0
             D = abs(dz)
-
             if D < 1e-12:
-                # dz == 0: change velocity while returning to same position
-                traj, info = generate_z_profile_same_position(
-                    z0=z0, vz0=vz0, vz1=vz1,
+                raise ValueError('This primitive requires z0 != z1 (monotonic motion along a line).')
+
+            # dz != 0
+            if self.monotonic.isChecked():
+                traj, info = generate_z_profile_monotonic_to_vz1(
+                    z0=z0, z1=z1, vz0=vz0, vz1=vz1,
                     vmax=vmax, amax_z=amax_z, jmax_z=jmax_z,
-                    sample_hz=sample_hz
+                    sample_hz=sample_hz,
+                    auto_increase_jerk=self.auto_jerk.isChecked(),
                 )
             else:
-                # dz != 0
-                if self.monotonic.isChecked():
-                    traj, info = generate_z_profile_monotonic_to_vz1(
-                        z0=z0, z1=z1, vz0=vz0, vz1=vz1,
-                        vmax=vmax, amax_z=amax_z, jmax_z=jmax_z,
-                        sample_hz=sample_hz,
-                        auto_increase_jerk=self.auto_jerk.isChecked(),
-                    )
-                else:
-                    # Legacy: normalized s(t) with possible interior peak speed
-                    # vz = sdot * dz  => sdot = vz / dz
-                    sdot0 = vz0 / dz
-                    sdot1 = vz1 / dz
+                # Legacy: normalized s(t) with possible interior peak speed
+                # vz = sdot * dz  => sdot = vz / dz
+                sdot0 = vz0 / dz
+                sdot1 = vz1 / dz
 
-                    # bounds in s-space use magnitude scaling by |dz|
-                    sdot_max = abs(vmax) / D
-                    amax_s = amax_z / D
-                    jmax_s = jmax_z / D
+                # bounds in s-space use magnitude scaling by |dz|
+                sdot_max = abs(vmax) / D
+                amax_s = amax_z / D
+                jmax_s = jmax_z / D
 
-                    sc, info = generate_scurve_normalized_with_vbounds(
-                        sdot0=sdot0, sdot1=sdot1,
-                        sdot_max=sdot_max,
-                        amax=amax_s, jmax=jmax_s,
-                        sample_hz=sample_hz
-                    )
-                    traj = map_scurve_to_z(sc, z0, z1)
+                sc, info = generate_scurve_normalized_with_vbounds(
+                    sdot0=sdot0, sdot1=sdot1,
+                    sdot_max=sdot_max,
+                    amax=amax_s, jmax=jmax_s,
+                    sample_hz=sample_hz
+                )
+                traj = map_scurve_to_z(sc, z0, z1)
 
             # envelope check over trajectory
             if env is not None:
@@ -697,16 +705,18 @@ class ScurvePlayground(QWidget):
                 )
             else:
                 mode = info.get("mode", "")
-                if mode == "monotonic_to_vz1":
+                if mode == "monotonic_to_vz1_no_coast":
                     self.status.setText(
                         f"Mode: {mode}\n"
                         f"T_total: {info.get('t_total', 0.0):.6f} s\n"
-                        f"t_dv: {info.get('t_dv', 0.0):.6f} s\n"
-                        f"t_cruise: {info.get('t_cruise', 0.0):.6f} s\n"
-                        f"j_used: {info.get('j_used', 0.0):.6f} m/s^3"
+                        f"time_scale: {info.get('time_scale', 1.0):.6f} (>=1 slows dynamics)\n"
+                        f"a_peak: {info.get('a_effective_peak', 0.0):.6f} m/s^2\n"
+                        f"j_peak: {info.get('j_effective_peak', 0.0):.6f} m/s^3\n"
+                        f"j_limit_used: {info.get('j_limit_used', 0.0):.6f} m/s^3"
                     )
                 else:
                     self.status.setText(
+
                         f"Mode: {mode}\n"
                         f"T_total: {info.get('t_total', 0.0):.6f} s\n"
                         f"v_peak: {info.get('v_peak', 0.0):.6f} m/s\n"
