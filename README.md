@@ -7,6 +7,7 @@
 * Option to scale acceleration/jerk to end segment at desired position/velocity end point.  Acceleration and jerk are scaled together with a linear k value together if both are applied, though optionally you can only scale one or the other. IF you scale neither, then the profile uses the exact acceleration and jerk.
 * TODO: Flag for success (position/velocity tolerance met)
 * TODO: Option to constrain start or end point when segment length can't be met
+* TODO: Add a0 and a1 input to allow for non-zero start/end acceleration, default to 0 in the class if not defined
 ### Path Planner
 * Juggling Pattern Generator - Catch/Throw sequences, positions, timing
 * Feasibility and optimiziation will happen at this layer
