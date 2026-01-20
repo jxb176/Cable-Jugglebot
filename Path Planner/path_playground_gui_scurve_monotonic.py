@@ -1,23 +1,20 @@
-# path_playground_gui_scurve_basic.py
+# path_playground_gui_scurve_monotonic_single_scale_v2.py
 # ------------------------------------------------------------
-# S-curve-only task-space path playground (Z-only)
-# Supports signed endpoint Z-velocities vz0/vz1 and |vz| <= v_max.
+# Z-only jerk-limited S-curve playground (monotonic dv primitive)
 #
-# Cases:
-#   A) dz != 0:
-#      Build normalized time law s(t) for s in [0,1] with endpoint sdot0/sdot1
-#      then map to z(t)=z0+s(t)*(z1-z0)
+# This playground ALWAYS generates the same primitive:
+#   - Jerk/accel-limited velocity transition from vz0 -> vz1 with a(0)=a(T)=0
+#   - No constant-velocity coast phase
+#   - Optional scaling of accel_ref and/or jerk_ref to better match the requested dz
+#   - Always returns a trajectory segment (planner decides feasibility)
 #
-#   B) dz == 0:
-#      Generate an "excursion" trajectory that returns to z0 but changes velocity
-#
-# Plots: position, velocity, acceleration, jerk
+# Outputs/plots: position z, velocity vz, acceleration az, jerk jz
 # ------------------------------------------------------------
 
 import sys
 import math
 import csv
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import numpy as np
 
@@ -31,10 +28,11 @@ import pyqtgraph as pg
 
 
 # ------------------------------------------------------------
-# Helpers: exact integration under constant jerk
+# Exact integration under constant jerk
 # State is (p, v, a)
 # ------------------------------------------------------------
-def _integrate_const_jerk(p: float, v: float, a: float, j: float, dt: float):
+
+def _integrate_const_jerk(p: float, v: float, a: float, j: float, dt: float) -> Tuple[float, float, float]:
     """Exact integration for constant jerk over dt."""
     p1 = p + v * dt + 0.5 * a * dt * dt + (1.0 / 6.0) * j * dt**3
     v1 = v + a * dt + 0.5 * j * dt * dt
@@ -43,22 +41,23 @@ def _integrate_const_jerk(p: float, v: float, a: float, j: float, dt: float):
 
 
 def _build_min_time_dv_segments(v_start: float, v_end: float, amax: float, jmax: float) -> List[Tuple[float, float]]:
-    """
-    Jerk-limited, accel-limited, min-time velocity change from v_start to v_end,
-    with a(t) starting/ending at 0.
+    """Min-time jerk-limited, accel-limited velocity transition v_start->v_end.
 
-    Returns list of (jerk, duration).
+    Assumes a(0)=0 and a(T)=0.
 
-    Works for any real v_start/v_end (can be negative).
+    Returns a list of (jerk, duration) segments with piecewise-constant jerk.
     """
     dv = v_end - v_start
     if abs(dv) < 1e-15:
         return []
 
+    if amax <= 0 or jmax <= 0:
+        return []
+
     sgn = 1.0 if dv > 0 else -1.0
     dv = abs(dv)
 
-    # Triangular accel candidate: a_peak = sqrt(dv * jmax)
+    # Triangular accel: a_peak = sqrt(dv * jmax)
     a_peak = math.sqrt(dv * jmax)
 
     if a_peak <= amax + 1e-15:
@@ -67,12 +66,11 @@ def _build_min_time_dv_segments(v_start: float, v_end: float, amax: float, jmax:
 
     # Trapezoidal accel (hits amax)
     Tj = amax / jmax
-    # dv = amax * (Ta + Tj)
     Ta = dv / amax - Tj
     if Ta < 0:
         Ta = 0.0
 
-    segs = [(sgn * jmax, Tj)]
+    segs: List[Tuple[float, float]] = [(sgn * jmax, Tj)]
     if Ta > 0:
         segs.append((0.0, Ta))
     segs.append((-sgn * jmax, Tj))
@@ -84,9 +82,9 @@ def _simulate_segments(
     p0: float,
     v0: float,
     a0: float,
-    dt: float
+    dt: float,
 ) -> np.ndarray:
-    """Sample rows [t, p, v, a, j] while integrating piecewise-constant jerk segments."""
+    """Sample rows [t, p, v, a, j] while integrating piecewise-constant jerk."""
     rows = []
     t = 0.0
     p = p0
@@ -107,10 +105,9 @@ def _simulate_segments(
 
 
 def _phase_distance_time(v_start: float, v_end: float, amax: float, jmax: float) -> Tuple[float, float, List[Tuple[float, float]]]:
-    """Return (distance, time, segments) for min-time velocity-change phase."""
+    """Return (distance, time, segments) for the min-time dv transition."""
     segs = _build_min_time_dv_segments(v_start, v_end, amax, jmax)
 
-    # exact integrate per segment boundary
     p = 0.0
     v = v_start
     a = 0.0
@@ -118,352 +115,191 @@ def _phase_distance_time(v_start: float, v_end: float, amax: float, jmax: float)
     for (j, dur) in segs:
         p, v, a = _integrate_const_jerk(p, v, a, j, dur)
         t += dur
+
     return p, t, segs
 
 
 # ------------------------------------------------------------
-# Normalized time-law planner: s(t) in [0,1] for dz != 0
-# Inputs are endpoint speeds and limits in s-space.
-# ------------------------------------------------------------
-def generate_scurve_normalized_with_vbounds(
-    sdot0: float,
-    sdot1: float,
-    sdot_max: float,
-    amax: float,
-    jmax: float,
-    sample_hz: float
-) -> Tuple[np.ndarray, dict]:
-    """
-    Build jerk-limited, accel-limited profile from s=0 to s=1 with endpoint velocities.
-
-    Structure:
-      sdot0 -> sdot_peak (min-time)
-      optional cruise at sdot_peak
-      sdot_peak -> sdot1 (min-time)
-
-    Constraints:
-      |sdot| <= sdot_max
-      |sddot| <= amax
-      |sdddot| <= jmax
-
-    For simplicity, sdot_peak is chosen >= 0 (a forward peak). sdot0/sdot1 may be signed.
-    Returns samples [t, s, sdot, sddot, sdddot].
-    """
-    if sample_hz <= 0:
-        raise ValueError("sample_hz must be > 0")
-    if amax <= 0 or jmax <= 0:
-        raise ValueError("amax and jmax must be > 0")
-    if sdot_max <= 0:
-        raise ValueError("sdot_max must be > 0")
-
-    sdot0 = float(sdot0)
-    sdot1 = float(sdot1)
-    sdot_max = float(sdot_max)
-
-    if abs(sdot0) - sdot_max > 1e-9 or abs(sdot1) - sdot_max > 1e-9:
-        raise ValueError("|vz0| or |vz1| exceed v_max (mapped to s-space)")
-
-    # peak forward speed (>=0)
-    v_lo = max(0.0, sdot0, sdot1)
-    v_hi = sdot_max
-
-    def d_min_for_peak(v_peak: float) -> float:
-        d1, _, _ = _phase_distance_time(sdot0, v_peak, amax, jmax)
-        d2, _, _ = _phase_distance_time(v_peak, sdot1, amax, jmax)
-        return d1 + d2
-
-    d_at_vhi = d_min_for_peak(v_hi)
-
-    if d_at_vhi <= 1.0 + 1e-12:
-        v_peak = v_hi
-        d_min = d_at_vhi
-        t_cruise = (1.0 - d_min) / v_peak if v_peak > 1e-15 else 0.0
-        mode = "cruise_at_vmax" if t_cruise > 0 else "no_cruise_at_vmax"
-    else:
-        d_at_vlo = d_min_for_peak(v_lo)
-        if d_at_vlo > 1.0 + 1e-12:
-            raise ValueError(
-                "Infeasible dz!=0 profile with given limits and endpoint speeds. "
-                "Try increasing |z1-z0|, increasing amax/jmax, reducing |vz0|/|vz1|, or increasing v_max."
-            )
-
-        lo = v_lo
-        hi = v_hi
-        for _ in range(90):
-            mid = 0.5 * (lo + hi)
-            dmid = d_min_for_peak(mid)
-            if dmid > 1.0:
-                hi = mid
-            else:
-                lo = mid
-            if abs(dmid - 1.0) < 1e-12:
-                break
-        v_peak = lo
-        t_cruise = 0.0
-        mode = "limited_peak_no_cruise"
-
-    segs1 = _build_min_time_dv_segments(sdot0, v_peak, amax, jmax)
-    segs2 = _build_min_time_dv_segments(v_peak, sdot1, amax, jmax)
-
-    segments: List[Tuple[float, float]] = []
-    segments.extend(segs1)
-    if t_cruise > 0:
-        segments.append((0.0, t_cruise))
-    segments.extend(segs2)
-
-    dt = 1.0 / float(sample_hz)
-    samples = _simulate_segments(segments, p0=0.0, v0=sdot0, a0=0.0, dt=dt)
-    if samples.shape[0] == 0:
-        raise ValueError("Degenerate profile")
-
-    # Normalize so s_end == 1 exactly (keeps continuity; scales derivatives consistently)
-    s_end = samples[-1, 1]
-    if abs(s_end) < 1e-15:
-        raise ValueError("Profile generation failed (near-zero distance)")
-    scale = 1.0 / s_end
-    samples[:, 1] *= scale
-    samples[:, 2] *= scale
-    samples[:, 3] *= scale
-    samples[:, 4] *= scale
-
-    info = {
-        "mode": mode,
-        "sdot_peak": float(v_peak),
-        "t_total": float(samples[-1, 0]),
-        "t_cruise": float(t_cruise),
-    }
-    return samples, info
-
-
-def map_scurve_to_z(sc: np.ndarray, z0: float, z1: float) -> np.ndarray:
-    """Map normalized samples [t, s, sdot, sddot, sjerk] to traj columns."""
-    dz = z1 - z0
-    traj = np.zeros((sc.shape[0], 13), dtype=float)
-    traj[:, 0] = sc[:, 0]
-    traj[:, 3] = z0 + sc[:, 1] * dz
-    traj[:, 6] = sc[:, 2] * dz
-    traj[:, 9] = sc[:, 3] * dz
-    traj[:, 12] = sc[:, 4] * dz
-    return traj
-
-
-
-
-# ------------------------------------------------------------
-# Monotonic velocity change (no overshoot of vz1)
-#
-# Plan structure for dz != 0:
-#   1) Jerk/accel-limited transition vz0 -> vz1 with a(t) starting/ending at 0.
-#      This guarantees velocity moves monotonically toward vz1 (no crossing/return).
-#   2) Optional cruise at vz1 to make the net displacement exactly dz.
-#
-# If dz is too short to fit the dv-transition at the requested jerk limit, we can
-# increase jerk until it fits (planning-layer feasibility).
+# Primitive: monotonic dv transition, no coasting, with optional scaling
 # ------------------------------------------------------------
 
-def generate_z_profile_monotonic_to_vz1(
+def generate_z_profile_dv_no_coast_scaled(
     z0: float,
     z1: float,
     vz0: float,
     vz1: float,
-    vmax: float,
-    a_ref_z: float,
-    j_ref_z: float,
+    accel_ref: float,
+    jerk_ref: float,
     sample_hz: float,
-    auto_increase_jerk: bool = True,
-    auto_increase_accel: bool = False,
-    growth: float = 1.5,
-    accel_max_cap: float = 1e9,
-    jerk_max_cap: float = 1e9,
-) -> tuple["np.ndarray", dict]:
-    """Monotonic (no overshoot) dv-based Z primitive with **no constant-velocity coast**.
+    scale_accel: bool,
+    scale_jerk: bool,
+    k_min: float = 1e-4,
+    k_max: float = 1e4,
+    grid_points: int = 81,
+) -> Tuple[np.ndarray, dict]:
+    """Generate a Z trajectory using only a dv transition (no cruise).
 
-    Assumes dz = z1 - z0 != 0 and enforces monotonic motion along that line.
+    We optionally apply a single scalar k to accel_ref and/or jerk_ref:
+      a_used = accel_ref * k if scale_accel else accel_ref
+      j_used = jerk_ref  * k if scale_jerk  else jerk_ref
 
-    Core idea (single scaling factor):
-      - Build the *min-time* jerk/accel-limited dv-transition vz0->vz1 with a(0)=a(T)=0.
-      - Choose a single scalar k to scale BOTH reference limits:
-            a_ref_eff = a_ref_z * k
-            j_ref_eff = j_ref_z * k
-        such that the min-time dv-transition displacement equals dz exactly.
+    k is chosen to minimize | |d_base(k)| - |dz| |, where d_base is the
+    dv-transition displacement from integrating the min-time dv segment.
 
-    This removes the need for a separate "feasibility scale" + "time_scale".
-    Reducing k makes the transition slower (larger displacement). Increasing k makes it
-    faster (smaller displacement). For dz that is "too short" at k=1, we require
-    auto-increase to be enabled to allow k>1.
+    Important: This function ALWAYS returns a trajectory. It does not throw
+    infeasibility errors based on dz, endpoint velocities, etc. Any mismatch is
+    reported in info so the higher-level planner can decide what to do.
 
-    Returns a 13-col trajectory array compatible with the existing GUI:
-      columns: [t, x,y,z, vx,vy,vz, ax,ay,az, jx,jy,jz] (only z/vz/az/jz filled).
+    The returned trajectory always ends exactly at z1 (we apply a constant
+    position offset); velocities/accelerations/jerks are unaffected by that
+    correction.
     """
     if sample_hz <= 0:
         raise ValueError("sample_hz must be > 0")
-    if vmax <= 0 or a_ref_z <= 0 or j_ref_z <= 0:
-        raise ValueError("vmax, a_ref_z, j_ref_z must be > 0")
 
-    z0 = float(z0); z1 = float(z1)
-    vz0 = float(vz0); vz1 = float(vz1)
-    vmax = float(vmax); a_ref_z = float(a_ref_z); j_ref_z = float(j_ref_z)
+    z0 = float(z0)
+    z1 = float(z1)
+    vz0 = float(vz0)
+    vz1 = float(vz1)
+    accel_ref = float(accel_ref)
+    jerk_ref = float(jerk_ref)
 
-    if abs(vz0) - vmax > 1e-9 or abs(vz1) - vmax > 1e-9:
-        raise ValueError("|vz0| or |vz1| exceed v_max")
-
-    dz = z1 - z0
-    if abs(dz) < 1e-12:
-        raise ValueError("This primitive requires z0 != z1 (dz != 0)")
-
-    # Basic monotonic-motion sanity (avoids silent direction reversal)
-    if dz > 0 and (vz0 + vz1) < -1e-9:
-        raise ValueError("dz>0 but endpoint velocities imply net -z motion; monotonic motion would be violated")
-    if dz < 0 and (vz0 + vz1) > 1e-9:
-        raise ValueError("dz<0 but endpoint velocities imply net +z motion; monotonic motion would be violated")
+    if accel_ref <= 0 or jerk_ref <= 0:
+        raise ValueError("accel_ref and jerk_ref must be > 0")
 
     dt = 1.0 / float(sample_hz)
+    dz = z1 - z0
 
-    def d_for_k(k: float) -> float:
-        d_tmp, _, _ = _phase_distance_time(vz0, vz1, a_ref_z * k, j_ref_z * k)
-        return float(d_tmp)
+    # If neither scaling is enabled, k is fixed at 1.
+    if not scale_accel and not scale_jerk:
+        k_used = 1.0
+    else:
+        # Clamp and ensure reasonable bounds
+        k_min = max(1e-12, float(k_min))
+        k_max = max(k_min * 1.0001, float(k_max))
+        grid_points = int(max(11, grid_points))
 
-    def build_for_k(k: float):
-        a_try = a_ref_z * float(k)
-        j_try = j_ref_z * float(k)
-        d_base, t_base, segs = _phase_distance_time(vz0, vz1, a_try, j_try)
+        # Sample k log-spaced to find best match
+        ks = np.logspace(math.log10(k_min), math.log10(k_max), grid_points)
+        dz_abs = abs(dz)
 
-        # Require dv-phase displacement in the same direction as dz
-        if dz * d_base < -1e-9:
-            return None, "dv-transition displacement has opposite sign to dz"
-        if abs(d_base) < 1e-15:
-            return None, "degenerate dv displacement (d_base≈0)"
+        best_k = float(ks[0])
+        best_err = float("inf")
+        best_d = 0.0
 
-        samples = _simulate_segments(segs, p0=z0, v0=vz0, a0=0.0, dt=dt)
-        if samples.shape[0] == 0:
-            return None, "degenerate profile"
+        for k in ks:
+            a_used = accel_ref * k if scale_accel else accel_ref
+            j_used = jerk_ref * k if scale_jerk else jerk_ref
+            d_base, _, _ = _phase_distance_time(vz0, vz1, a_used, j_used)
 
-        # Numerical correction to land exactly at z1
-        z_end = samples[-1, 1]
-        samples[:, 1] += (z1 - z_end)
+            err = abs(abs(d_base) - dz_abs)
+            if err < best_err:
+                best_err = err
+                best_k = float(k)
+                best_d = float(d_base)
 
-        traj = np.zeros((samples.shape[0], 13), dtype=float)
-        traj[:, 0] = samples[:, 0]
-        traj[:, 3] = samples[:, 1]
-        traj[:, 6] = samples[:, 2]
-        traj[:, 9] = samples[:, 3]
-        traj[:, 12] = samples[:, 4]
+        # Local refine around best_k with a few bisection iterations if possible.
+        # We try to bracket a sign change for f(k)=|d(k)|-|dz|.
+        def f(k: float) -> float:
+            a_used = accel_ref * k if scale_accel else accel_ref
+            j_used = jerk_ref * k if scale_jerk else jerk_ref
+            d_base, _, _ = _phase_distance_time(vz0, vz1, a_used, j_used)
+            return abs(d_base) - dz_abs
 
+        k_used = best_k
+        f_mid = f(k_used)
+
+        # Choose neighbors from the sampled grid
+        idx = int(np.argmin(np.abs(ks - best_k)))
+        lo = float(ks[max(0, idx - 1)])
+        hi = float(ks[min(len(ks) - 1, idx + 1)])
+        f_lo = f(lo)
+        f_hi = f(hi)
+
+        # If we have a bracket, bisection to reduce error.
+        if f_lo == 0.0:
+            k_used = lo
+        elif f_hi == 0.0:
+            k_used = hi
+        elif f_lo * f_hi < 0.0:
+            a = lo
+            b = hi
+            fa = f_lo
+            fb = f_hi
+            for _ in range(40):
+                m = 0.5 * (a + b)
+                fm = f(m)
+                # Keep smaller interval
+                if fa * fm <= 0.0:
+                    b = m
+                    fb = fm
+                else:
+                    a = m
+                    fa = fm
+            k_used = 0.5 * (a + b)
+
+    # Build final profile at k_used
+    a_used = accel_ref * k_used if scale_accel else accel_ref
+    j_used = jerk_ref * k_used if scale_jerk else jerk_ref
+
+    d_base, t_base, segs = _phase_distance_time(vz0, vz1, a_used, j_used)
+    samples = _simulate_segments(segs, p0=z0, v0=vz0, a0=0.0, dt=dt)
+
+    if samples.shape[0] == 0:
+        # Degenerate: return a single sample at t=0
+        traj = np.zeros((1, 13), dtype=float)
+        traj[0, 0] = 0.0
+        traj[0, 3] = z0
+        traj[0, 6] = vz0
         info = {
-            "mode": "monotonic_to_vz1_no_coast",
-            "t_total": float(traj[-1, 0]),
-            "t_base": float(t_base),
-            "k_used": float(k),
-            "a_ref_used": float(a_try),
-            "j_ref_used": float(j_try),
-            "a_effective_peak": float(np.max(np.abs(traj[:, 9]))),
-            "j_effective_peak": float(np.max(np.abs(traj[:, 12]))),
+            "mode": "dv_no_coast_scaled",
+            "k_used": float(k_used),
+            "accel_ref_used": float(a_used),
+            "jerk_ref_used": float(j_used),
             "d_base": float(d_base),
             "dz": float(dz),
+            "t_total": 0.0,
+            "degenerate": True,
         }
         return traj, info
 
-    dz_abs = abs(dz)
-    tol_abs = max(1e-10, 1e-8 * dz_abs)
+    # Force end position to z1 by constant offset (does not change v/a/j)
+    z_end = float(samples[-1, 1])
+    samples[:, 1] += (z1 - z_end)
 
-    # Evaluate at k=1
-    k0 = 1.0
-    d0 = d_for_k(k0)
-    if dz * d0 < -1e-9:
-        raise ValueError("dv-transition displacement has opposite sign to dz")
+    traj = np.zeros((samples.shape[0], 13), dtype=float)
+    traj[:, 0] = samples[:, 0]
+    traj[:, 3] = samples[:, 1]
+    traj[:, 6] = samples[:, 2]
+    traj[:, 9] = samples[:, 3]
+    traj[:, 12] = samples[:, 4]
 
-    # If already close enough, build directly
-    if abs(abs(d0) - dz_abs) <= tol_abs:
-        traj, info = build_for_k(k0)
-        if traj is None:
-            raise ValueError("Degenerate profile at k=1.0: " + str(info))
-        return traj, info
-
-    # Determine if we need k>1 (shorter dz) or k<1 (longer dz)
-    if abs(d0) > dz_abs + tol_abs:
-        # Need to increase k to reduce |d|
-        if not (auto_increase_jerk or auto_increase_accel):
-            raise ValueError(
-                "Infeasible (dz too short) under current refs and auto-increase disabled. "
-                f"|d_base(k=1)|={abs(d0):.6g} > |dz|={dz_abs:.6g}"
-            )
-
-        # Cap on k based on enabled auto-increase options
-        k_cap = 1e30
-        if auto_increase_accel:
-            k_cap = min(k_cap, accel_max_cap / a_ref_z)
-        if auto_increase_jerk:
-            k_cap = min(k_cap, jerk_max_cap / j_ref_z)
-
-        k_lo = k0
-        k_hi = k0
-        d_hi = d0
-        for _ in range(80):
-            if k_hi >= k_cap - 1e-12:
-                break
-            k_hi = min(k_hi * float(growth), k_cap)
-            d_hi = d_for_k(k_hi)
-            if abs(d_hi) <= dz_abs + tol_abs:
-                break
-
-        if abs(d_hi) > dz_abs + tol_abs:
-            raise ValueError(
-                "Infeasible even after increasing refs up to caps. "
-                f"|d_base(k_cap={k_hi:.6g})|={abs(d_hi):.6g} still > |dz|={dz_abs:.6g}"
-            )
-
-    else:
-        # Need to decrease k to increase |d| (always allowed)
-        k_hi = k0
-        k_lo = k0
-        d_lo = d0
-        for _ in range(80):
-            k_lo = k_lo / float(growth)
-            d_lo = d_for_k(k_lo)
-            if abs(d_lo) >= dz_abs - tol_abs:
-                break
-            if k_lo < 1e-12:
-                break
-
-        if abs(d_lo) < dz_abs - tol_abs:
-            raise ValueError(
-                "Could not increase displacement enough by reducing k. "
-                f"|d_base(k={k_lo:.6g})|={abs(d_lo):.6g} < |dz|={dz_abs:.6g}"
-            )
-
-    # Bisection solve k in [k_lo, k_hi] for |d(k)| == |dz|
-    for _ in range(80):
-        k_mid = 0.5 * (k_lo + k_hi)
-        d_mid = d_for_k(k_mid)
-        if abs(abs(d_mid) - dz_abs) <= tol_abs:
-            k_lo = k_hi = k_mid
-            break
-        # If |d_mid| too big, increase k
-        if abs(d_mid) > dz_abs:
-            k_lo = k_mid
-        else:
-            k_hi = k_mid
-
-    k_used = 0.5 * (k_lo + k_hi)
-    traj, info = build_for_k(k_used)
-    if traj is None:
-        reason = info if isinstance(info, str) else str(info)
-        raise ValueError(
-            "Infeasible monotonic no-coast profile with given reference limits. "
-            + reason
-            + ". Try increasing accel_ref/jerk_ref, increasing |z1-z0|, or relaxing endpoint velocities."
-        )
-
+    info = {
+        "mode": "dv_no_coast_scaled",
+        "k_used": float(k_used),
+        "scale_accel": bool(scale_accel),
+        "scale_jerk": bool(scale_jerk),
+        "accel_ref_used": float(a_used),
+        "jerk_ref_used": float(j_used),
+        "a_peak": float(np.max(np.abs(traj[:, 9]))),
+        "j_peak": float(np.max(np.abs(traj[:, 12]))),
+        "t_total": float(traj[-1, 0]),
+        "t_base": float(t_base),
+        "d_base": float(d_base),
+        "dz": float(dz),
+        "d_error_abs": float(abs(abs(d_base) - abs(dz))),
+    }
     return traj, info
 
 
 # ------------------------------------------------------------
 # GUI
 # ------------------------------------------------------------
+
 class ScurvePlayground(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Z S-curve Playground (vz0/vz1/vmax)")
+        self.setWindowTitle("Z S-curve Playground (dv primitive, no coast)")
 
         root = QHBoxLayout(self)
         left = QVBoxLayout()
@@ -478,57 +314,62 @@ class ScurvePlayground(QWidget):
 
         row = 0
         g.addWidget(QLabel("z0 [m]"), row, 0)
-        self.z0 = QDoubleSpinBox(); self.z0.setRange(-10, 10); self.z0.setDecimals(4); self.z0.setValue(0.0)
+        self.z0 = QDoubleSpinBox(); self.z0.setRange(-10, 10); self.z0.setDecimals(6); self.z0.setValue(-0.25)
         g.addWidget(self.z0, row, 1); row += 1
 
         g.addWidget(QLabel("z1 [m]"), row, 0)
-        self.z1 = QDoubleSpinBox(); self.z1.setRange(-10, 10); self.z1.setDecimals(4); self.z1.setValue(0.3)
+        self.z1 = QDoubleSpinBox(); self.z1.setRange(-10, 10); self.z1.setDecimals(6); self.z1.setValue(0.0)
         g.addWidget(self.z1, row, 1); row += 1
 
         g.addWidget(QLabel("vz0 [m/s]"), row, 0)
-        self.vz0 = QDoubleSpinBox(); self.vz0.setRange(-100, 100); self.vz0.setDecimals(4); self.vz0.setValue(0.0)
+        self.vz0 = QDoubleSpinBox(); self.vz0.setRange(-1e4, 1e4); self.vz0.setDecimals(6); self.vz0.setValue(0.0)
         g.addWidget(self.vz0, row, 1); row += 1
 
         g.addWidget(QLabel("vz1 [m/s]"), row, 0)
-        self.vz1 = QDoubleSpinBox(); self.vz1.setRange(-100, 100); self.vz1.setDecimals(4); self.vz1.setValue(0.0)
+        self.vz1 = QDoubleSpinBox(); self.vz1.setRange(-1e4, 1e4); self.vz1.setDecimals(6); self.vz1.setValue(5.0)
         g.addWidget(self.vz1, row, 1); row += 1
 
-        g.addWidget(QLabel("v_max |vz| [m/s]"), row, 0)
-        self.vmax = QDoubleSpinBox(); self.vmax.setRange(0.001, 1000); self.vmax.setDecimals(4); self.vmax.setValue(3.0)
-        g.addWidget(self.vmax, row, 1); row += 1
-
-        self.monotonic = QCheckBox("Monotonic to vz1 (no overshoot)")
-        self.monotonic.setChecked(True)
-        g.addWidget(self.monotonic, row, 0, 1, 2); row += 1
-
-        self.auto_jerk = QCheckBox("Auto-increase jerk_ref if infeasible")
-        self.auto_jerk.setChecked(True)
-        g.addWidget(self.auto_jerk, row, 0, 1, 2); row += 1
-
-        self.auto_accel = QCheckBox("Auto-increase accel_ref if infeasible")
-        self.auto_accel.setChecked(False)
-        g.addWidget(self.auto_accel, row, 0, 1, 2); row += 1
-
-        g.addWidget(QLabel("Feasibility growth"), row, 0)
-        self.feas_growth = QDoubleSpinBox(); self.feas_growth.setRange(1.01, 10.0); self.feas_growth.setDecimals(3); self.feas_growth.setValue(1.5)
-        g.addWidget(self.feas_growth, row, 1); row += 1
-
         # ---- Limits ----
-        lg = QGroupBox("Limits")
+        lg = QGroupBox("Reference dynamics")
         left.addWidget(lg)
         lgd = QGridLayout(lg)
 
-        lgd.addWidget(QLabel("a_ref_z [m/s²]"), 0, 0)
-        self.amax = QDoubleSpinBox(); self.amax.setRange(0.01, 1e6); self.amax.setDecimals(3); self.amax.setValue(50.0)
-        lgd.addWidget(self.amax, 0, 1)
+        lgd.addWidget(QLabel("accel_ref [m/s²]"), 0, 0)
+        self.accel_ref = QDoubleSpinBox(); self.accel_ref.setRange(1e-6, 1e9); self.accel_ref.setDecimals(6); self.accel_ref.setValue(50.0)
+        lgd.addWidget(self.accel_ref, 0, 1)
 
-        lgd.addWidget(QLabel("j_ref_z [m/s³]"), 1, 0)
-        self.jmax = QDoubleSpinBox(); self.jmax.setRange(0.01, 1e6); self.jmax.setDecimals(3); self.jmax.setValue(200.0)
-        lgd.addWidget(self.jmax, 1, 1)
+        lgd.addWidget(QLabel("jerk_ref [m/s³]"), 1, 0)
+        self.jerk_ref = QDoubleSpinBox(); self.jerk_ref.setRange(1e-6, 1e12); self.jerk_ref.setDecimals(6); self.jerk_ref.setValue(2000.0)
+        lgd.addWidget(self.jerk_ref, 1, 1)
 
         lgd.addWidget(QLabel("Sample Hz"), 2, 0)
-        self.sample_hz = QDoubleSpinBox(); self.sample_hz.setRange(10, 2000); self.sample_hz.setValue(200)
+        self.sample_hz = QDoubleSpinBox(); self.sample_hz.setRange(10, 5000); self.sample_hz.setDecimals(1); self.sample_hz.setValue(1000.0)
         lgd.addWidget(self.sample_hz, 2, 1)
+
+        # ---- Scaling options ----
+        sg = QGroupBox("Optional scaling")
+        left.addWidget(sg)
+        sgd = QGridLayout(sg)
+
+        self.scale_accel = QCheckBox("Scale accel_ref")
+        self.scale_accel.setChecked(True)
+        sgd.addWidget(self.scale_accel, 0, 0, 1, 2)
+
+        self.scale_jerk = QCheckBox("Scale jerk_ref")
+        self.scale_jerk.setChecked(True)
+        sgd.addWidget(self.scale_jerk, 1, 0, 1, 2)
+
+        sgd.addWidget(QLabel("k_min"), 2, 0)
+        self.k_min = QDoubleSpinBox(); self.k_min.setRange(1e-12, 1e6); self.k_min.setDecimals(8); self.k_min.setValue(1e-4)
+        sgd.addWidget(self.k_min, 2, 1)
+
+        sgd.addWidget(QLabel("k_max"), 3, 0)
+        self.k_max = QDoubleSpinBox(); self.k_max.setRange(1e-12, 1e12); self.k_max.setDecimals(8); self.k_max.setValue(1e4)
+        sgd.addWidget(self.k_max, 3, 1)
+
+        sgd.addWidget(QLabel("Grid points"), 4, 0)
+        self.grid_points = QDoubleSpinBox(); self.grid_points.setRange(11, 401); self.grid_points.setDecimals(0); self.grid_points.setValue(81)
+        sgd.addWidget(self.grid_points, 4, 1)
 
         # Buttons
         self.btn_run = QPushButton("Generate")
@@ -552,7 +393,7 @@ class ScurvePlayground(QWidget):
         right.addWidget(self.plot_a, 1)
         right.addWidget(self.plot_j, 1)
 
-        self.last_traj = None
+        self.last_traj: Optional[np.ndarray] = None
 
         self.btn_run.clicked.connect(self.run)
         self.btn_export.clicked.connect(self.export_csv)
@@ -563,77 +404,36 @@ class ScurvePlayground(QWidget):
             z1 = float(self.z1.value())
             vz0 = float(self.vz0.value())
             vz1 = float(self.vz1.value())
-            vmax = float(self.vmax.value())
-            a_ref_z = float(self.amax.value())
-            j_ref_z = float(self.jmax.value())
+            accel_ref = float(self.accel_ref.value())
+            jerk_ref = float(self.jerk_ref.value())
             sample_hz = float(self.sample_hz.value())
 
-            dz = z1 - z0
-            D = abs(dz)
-            if D < 1e-12:
-                raise ValueError('This primitive requires z0 != z1 (monotonic motion along a line).')
-
-            # dz != 0
-            if self.monotonic.isChecked():
-                traj, info = generate_z_profile_monotonic_to_vz1(
-                    z0=z0, z1=z1, vz0=vz0, vz1=vz1,
-                    vmax=vmax, a_ref_z=a_ref_z, j_ref_z=j_ref_z,
-                    sample_hz=sample_hz,
-                    auto_increase_jerk=self.auto_jerk.isChecked(),
-                    auto_increase_accel=self.auto_accel.isChecked(),
-                    growth=float(self.feas_growth.value()),
-                )
-            else:
-                # Legacy: normalized s(t) with possible interior peak speed
-                # vz = sdot * dz  => sdot = vz / dz
-                sdot0 = vz0 / dz
-                sdot1 = vz1 / dz
-
-                # bounds in s-space use magnitude scaling by |dz|
-                sdot_max = abs(vmax) / D
-                amax_s = a_ref_z / D
-                jmax_s = j_ref_z / D
-
-                sc, info = generate_scurve_normalized_with_vbounds(
-                    sdot0=sdot0, sdot1=sdot1,
-                    sdot_max=sdot_max,
-                    amax=amax_s, jmax=jmax_s,
-                    sample_hz=sample_hz
-                )
-                traj = map_scurve_to_z(sc, z0, z1)
+            traj, info = generate_z_profile_dv_no_coast_scaled(
+                z0=z0,
+                z1=z1,
+                vz0=vz0,
+                vz1=vz1,
+                accel_ref=accel_ref,
+                jerk_ref=jerk_ref,
+                sample_hz=sample_hz,
+                scale_accel=self.scale_accel.isChecked(),
+                scale_jerk=self.scale_jerk.isChecked(),
+                k_min=float(self.k_min.value()),
+                k_max=float(self.k_max.value()),
+                grid_points=int(self.grid_points.value()),
+            )
 
             self.last_traj = traj
             self.update_plots(traj)
 
-            # status
-            if "sdot_peak" in info:
-                v_peak = info["sdot_peak"] * dz
-                self.status.setText(
-                    f"Mode: {info.get('mode','')}\n"
-                    f"T_total: {info.get('t_total', 0.0):.6f} s\n"
-                    f"sdot_peak: {info['sdot_peak']:.6f}  (vz_peak ≈ {v_peak:.6f} m/s)\n"
-                    f"t_cruise: {info.get('t_cruise', 0.0):.6f} s"
-                )
-            else:
-                mode = info.get("mode", "")
-                if mode == "monotonic_to_vz1_no_coast":
-                    self.status.setText(
-                        f"Mode: {mode}\n"
-                        f"T_total: {info.get('t_total', 0.0):.6f} s\n"
-                        f"k_used: {info.get('k_used', 1.0):.6f} (scales accel_ref & jerk_ref)\n"
-                        f"a_peak: {info.get('a_effective_peak', 0.0):.6f} m/s^2\n"
-                        f"j_peak: {info.get('j_effective_peak', 0.0):.6f} m/s^3\n"
-                        f"a_ref_used: {info.get('a_ref_used', 0.0):.6f} m/s^2\n"
-                        f"j_ref_used: {info.get('j_ref_used', 0.0):.6f} m/s^3"
-                    )
-                else:
-                    self.status.setText(
-
-                        f"Mode: {mode}\n"
-                        f"T_total: {info.get('t_total', 0.0):.6f} s\n"
-                        f"v_peak: {info.get('v_peak', 0.0):.6f} m/s\n"
-                        f"t_cruise: {info.get('t_cruise', 0.0):.6f} s"
-                    )
+            self.status.setText(
+                f"Mode: {info.get('mode','')}\n"
+                f"T_total: {info.get('t_total',0.0):.6f} s\n"
+                f"k_used: {info.get('k_used',1.0):.6g}  (scale_accel={info.get('scale_accel',False)}, scale_jerk={info.get('scale_jerk',False)})\n"
+                f"accel_ref_used: {info.get('accel_ref_used',0.0):.6g}  jerk_ref_used: {info.get('jerk_ref_used',0.0):.6g}\n"
+                f"a_peak: {info.get('a_peak',0.0):.6g}  j_peak: {info.get('j_peak',0.0):.6g}\n"
+                f"dz: {info.get('dz',0.0):.6g}  d_base: {info.get('d_base',0.0):.6g}  |error|: {info.get('d_error_abs',0.0):.6g}"
+            )
 
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -676,7 +476,7 @@ class ScurvePlayground(QWidget):
             w = csv.writer(f)
             w.writerow(["t", "x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az", "jx", "jy", "jz"])
             for row in self.last_traj:
-                w.writerow([f"{v:.6f}" for v in row])
+                w.writerow([f"{v:.10g}" for v in row])
 
 
 def main():
