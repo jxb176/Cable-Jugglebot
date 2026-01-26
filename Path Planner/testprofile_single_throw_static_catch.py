@@ -7,10 +7,6 @@ Example usage of your JugglePath + LineDVNoCoastScaled primitives:
 - Plots 4 stacked plots (pos/vel/acc/jerk) for x,y,z
 - Shows a separate 3D animation of the motion
 
-Assumes you have:
-  from juggle_path_xyz import State3D, JugglePath, LineDVNoCoastScaled
-in your library module (no __main__ demo in the library file).
-
 Keys in animation window (matches your manual planner feel):
   space : play/pause
   left  : step backward
@@ -24,11 +20,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-# --- Import your library ---
-# Adjust this import to match your project structure.
-# e.g. from path_primitives.juggle_path_xyz import State3D, JugglePath, LineDVNoCoastScaled
-from jugglepath import State3D, JugglePath, LineDVNoCoastScaled
-
+from jugglepath import State3D, JugglePath
 
 # ----------------------------
 # Plotting helper (copied pattern from manual_juggle_planner.py)
@@ -181,58 +173,96 @@ def animate_xyz(traj: np.ndarray, stride: int = 1, trail: int = 250):
 # ----------------------------
 def build_demo_path(sample_hz: float = 500.0):
     start = State3D(p=[0, 0, 0], v=[0, 0, 0], a=[0, 0, 0])
-
     path = JugglePath(start=start, sample_hz=sample_hz)
 
-    # A small "box-ish" path with different directions
-    # v1_along is the commanded along-line terminal speed for each segment.
+    throw_v = 4.9
+
     accel_ref = 50.0
     jerk_ref = 2000.0
 
-    path.add(LineDVNoCoastScaled(
-        p1=[0.0, 0.0, -0.15],
-        v1_along=1.0,
-        accel_ref=5, jerk_ref=100,
-        scale_accel=True, scale_jerk=True
-    ))
+    # Segment 1: 0 -> -0.2 (down). Limit accel to 0.5g so the ball stays in the hand on initial accel down.
+    path.add_segment(
+        p=[0.0, 0.0, -0.2],
+        v=[0.0, 0.0, 0.0],  # waypoint velocity
+        time_law="s_curve",
+        accel_ref=5.0,
+        jerk_ref=500.0,
+    )
 
-    path.add(LineDVNoCoastScaled(
-        p1=[0.0, 0.0, -0.2],
-        v1_along=0.0,
-        accel_ref=accel_ref, jerk_ref=jerk_ref,
-        scale_accel=True, scale_jerk=True
-    ))
+    # Segment 2.1: -0.2 -> 0.0 (up). v1_along=+6.0 => +Z => vz=+6.0
+    path.add_segment(
+        p=[0.0, 0.0, 0.0],
+        v=[0.0, 0.0, throw_v],  # waypoint velocity
+        time_law="s_curve_monotonic",
+        accel_ref=accel_ref,
+        jerk_ref=jerk_ref,
+    )
 
-    path.add(LineDVNoCoastScaled(
-        p1=[0.0, 0.0, 0.0],
-        v1_along=6.0,
-        accel_ref=accel_ref, jerk_ref=jerk_ref,
-        scale_accel=True, scale_jerk=True
-    ))
+    # Segment 2.2: 0.0 -> 0.2 (up). End speed 0.
+    path.add_segment(
+        p=[0.0, 0.0, 0.2],
+        v=[0.0, 0.0, 0.0],  # waypoint velocity
+        time_law="s_curve_monotonic",
+        accel_ref=accel_ref,
+        jerk_ref=jerk_ref,
+    )
 
-    path.add(LineDVNoCoastScaled(
-        p1=[0.0, 0.0, 0.2],
-        v1_along=0.0,
-        accel_ref=accel_ref, jerk_ref=jerk_ref,
-        scale_accel=True, scale_jerk=True
-    ))
+    # Segment 3: -0.2 -> 0.0 (down), Return to start point and hold
+    path.add_segment(
+        p=[0.0, 0.0, 0.0],
+        v=[0.0, 0.0, 0.0],  # waypoint velocity
+        time_law="s_curve",
+        accel_ref=20.0,
+        jerk_ref=1000.0,
+        v_max=1.0,
+    )
 
-    path.add(LineDVNoCoastScaled(
-        p1=[0.0, 0.0, 0.1],
-        v1_along=1.0,
-        accel_ref=accel_ref, jerk_ref=jerk_ref,
-        scale_accel=True, scale_jerk=True
-    ))
+"""
+# 3d example
+    # Segment 1: 0 -> -0.2 (down). Limit accel to 0.5g so the ball stays in the hand on initial accel down.
+    path.add_segment(
+        p=[-0.05, 0.0, -0.2],
+        v=[0.0, 0.0, 0.0],  # waypoint velocity
+        time_law="s_curve",
+        accel_ref=5.0,
+        jerk_ref=500.0,
+    )
 
-    path.add(LineDVNoCoastScaled(
-        p1=[0.0, 0.0, 0.0],
-        v1_along=0.0,
-        accel_ref=accel_ref, jerk_ref=jerk_ref,
-        scale_accel=True, scale_jerk=True
-    ))
+    # Segment 2.1: -0.2 -> 0.0 (up). v1_along=+6.0 => +Z => vz=+6.0
+    path.add_segment(
+        p=[0.0, 0.0, 0.0],
+        v=[throw_v/4, 0.0, throw_v],  # waypoint velocity
+        time_law="s_curve_monotonic",
+        accel_ref=accel_ref,
+        jerk_ref=jerk_ref,
+    )
+
+    # Segment 2.2: 0.0 -> 0.2 (up). End speed 0.
+    path.add_segment(
+        p=[0.05, 0.0, 0.2],
+        v=[0.0, 0.0, 0.0],  # waypoint velocity
+        time_law="s_curve_monotonic",
+        accel_ref=accel_ref,
+        jerk_ref=jerk_ref,
+    )
+
+    # Segment 3: -0.2 -> 0.0 (down), Return to start point and hold
+    path.add_segment(
+        p=[0.3, 0.0, 0.0],
+        v=[0.0, 0.0, 0.0],  # waypoint velocity
+        time_law="s_curve",
+        accel_ref=20.0,
+        jerk_ref=1000.0,
+        v_max=1.0,
+    )
+    
+    path.add_wait(duration=2.0)
+
+"""
 
     res = path.build()
     return res
+
 
 
 def main():
