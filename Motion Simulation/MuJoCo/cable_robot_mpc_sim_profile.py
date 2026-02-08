@@ -83,40 +83,71 @@ def tendon_jacobian_fd(model, data, tendon_ids, qpos_adr, eps_pos=1e-6, eps_ang=
 
 
 
-def solve_tensions_least_squares(J, tau_des, T0, Tmax, lam=1e-3, iters=80):
-    """Solve for tensions T in [0, Tmax] that best match generalized forces.
+def solve_tensions_least_squares(J, tau_des, T_prev, Tmin, Tmax, lam=1e-2, iters=80, alpha=0.2):
+    """Solve for tensions T in [Tmin, Tmax] that best match generalized forces.
 
-    We use projected gradient descent on:
-        min_T || (-J^T) T - tau_des ||^2 + lam ||T - T0||^2
-        s.t. 0 <= T <= Tmax
+    Projected gradient descent on:
+        min_T || (-J^T) T - tau_des ||^2 + lam ||T - Tref||^2
+        s.t.  Tmin <= T <= Tmax
 
-    T0 acts as pretension (bias toward non-slack), but the bounds are always enforced.
+    Where the regularization target blends prior tensions with Tmin:
+        Tref = clip((1-alpha)*T_prev + alpha*Tmin, Tmin, Tmax)   if T_prev exists
+        Tref = Tmin                                              otherwise
+
+    alpha in [0,1]:
+      - alpha=0: bias toward T_prev (smooth)
+      - alpha=1: bias toward Tmin (minimize tensions when possible)
     """
+    J = np.asarray(J, dtype=float)
+    tau_des = np.asarray(tau_des, dtype=float).reshape(-1)
+
+    if not np.all(np.isfinite(J)) or not np.all(np.isfinite(tau_des)):
+        raise ValueError("Non-finite values in J or tau_des")
+
     # Map tensions -> generalized force
-    A = -J.T                       # (ndof x ntendon)
-    nt = A.shape[1]
-    lb = np.zeros(nt)
-    ub = np.full(nt, Tmax)
+    A = -J.T  # shape: (ndof, nt)
+    ndof, nt = A.shape
 
-    # Initialize near pretension
-    T = np.clip(np.full(nt, T0), lb, ub)
+    if tau_des.shape[0] != ndof:
+        raise ValueError(f"Dimension mismatch: A is {A.shape}, tau_des is {tau_des.shape}")
 
-    # Quadratic objective:
-    # f(T)=||A T - tau||^2 + lam ||T - T0||^2
-    # grad = 2 A^T (A T - tau) + 2 lam (T - T0)
+    lb = np.full(nt, float(Tmin), dtype=float)
+    ub = np.full(nt, float(Tmax), dtype=float)
+
+    # Build reference tension (regularization target)
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    if T_prev is not None:
+        T_prev = np.asarray(T_prev, dtype=float).reshape(-1)
+        if T_prev.shape[0] != nt:
+            raise ValueError(f"T_prev has shape {T_prev.shape}, expected ({nt},)")
+        Tref = (1.0 - alpha) * T_prev + alpha * lb
+        Tref = np.clip(Tref, lb, ub)
+    else:
+        Tref = lb.copy()
+
+    # Initialize at reference
+    T = Tref.copy()
+
     AtA = A.T @ A
     Atb = A.T @ tau_des
 
-    # Lipschitz estimate for step (safe)
-    L = np.linalg.norm(2*AtA + 2*lam*np.eye(nt), ord=2)
+    # Safe step size based on Lipschitz bound of gradient:
+    # grad = 2*AtA*T - 2*Atb + 2*lam*(T - Tref)
+    H = 2.0 * AtA + 2.0 * lam * np.eye(nt)
+    L = float(np.max(np.linalg.eigvalsh(H)))
     step = 1.0 / max(L, 1e-9)
 
-    T0v = np.full(nt, T0)
-
     for _ in range(iters):
-        grad = 2*(AtA @ T - Atb) + 2*lam*(T - T0v)
+        T_old = T
+        grad = 2.0 * (AtA @ T - Atb) + 2.0 * lam * (T - Tref)
         T = np.clip(T - step * grad, lb, ub)
+
+        # Optional early-out (helps performance / reduces tiny bound-chatter)
+        if np.max(np.abs(T - T_old)) < 1e-6:
+            break
+
     return T
+
 
 
 def load_pose_profile_csv(path):
@@ -235,13 +266,15 @@ def make_default_reference():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--xml", default="cable_robot_5dof.xml", help="MuJoCo XML model path")
-    ap.add_argument("--profile", default="pose_cmd.csv", help="CSV profile path (pose_cmd.csv)")
+    ap.add_argument("--profile", default="pose_cmd_full.csv", help="CSV profile path (pose_cmd.csv)")
     ap.add_argument("--no-profile", action="store_true", help="Ignore CSV and use default sine reference")
     ap.add_argument("--T0", type=float, default=30.0, help="Pretension (N)")
     ap.add_argument("--Tmax", type=float, default=None, help="Max tension (N) override")
     ap.add_argument("--Kp", type=float, default=80.0, help="Base Kp for xyz (N/m) and angles (Nm/rad) scaling")
     ap.add_argument("--Kd", type=float, default=20.0, help="Base Kd for xyz (N/(m/s)) and angles (Nm/(rad/s)) scaling")
     ap.add_argument("--sim-time", type=float, default=10.0, help="Simulation duration (s)")
+    ap.add_argument("--Tmin", type=float, default=10.0, help="Minimum tension (N)")
+    ap.add_argument("--lamT", type=float, default=5e-2, help="Regularization weight toward T_prev")
     args = ap.parse_args()
 
     model = mujoco.MjModel.from_xml_path(args.xml)
@@ -269,6 +302,18 @@ def main():
             Tmax = float(np.min(model.actuator_ctrlrange[:, 1]))
         except Exception:
             Tmax = 150.0
+
+    Tmin = args.Tmin  # start here; tune 5–30 N depending on your geometry
+    T_prev = np.full(6, args.T0, dtype=float)
+
+    # --- Actuator / capstan parameters (per cable) ---
+    capstan_r = np.full(6, 0.010, dtype=float)   # [m] effective radius (example: 10 mm)
+    gear_N    = np.full(6, 1.0,  dtype=float)    # motor_angle / capstan_angle
+    J_eq      = np.full(6, 2.28e-6, dtype=float)  # [kg*m^2] equiv inertia at motor (RI50)
+
+    # Optional viscous motor damping (set to 0 if unknown)
+    b_eq      = np.zeros(6, dtype=float)         # [N*m*s/rad]
+
 
     # Reference
     if (not args.no_profile) and args.profile:
@@ -300,11 +345,17 @@ def main():
     log_tau_fb = np.zeros((max_steps, 5))
     log_tau_des = np.zeros((max_steps, 5))
 
+    log_tau_m_ff = np.zeros((max_steps, 6))   # motor torque feedforward per cable
+    log_sdot = np.zeros((max_steps, 6))
+    log_sdd  = np.zeros((max_steps, 6))
+
     log_T = np.zeros((max_steps, 6))
 
     qd_prev = None
     qdref_prev = None
     t_prev = None
+    J_prev = None
+    tJ_prev = None
 
     # Viewer
     with viewer.launch_passive(model, data) as v:
@@ -341,7 +392,42 @@ def main():
 
             # Tendon Jacobian and tension allocation
             J = tendon_jacobian_fd(model, data, tendon_ids, qpos_adr)
-            T = solve_tensions_least_squares(J, tau_des, T0=args.T0, Tmax=Tmax, lam=1e-2, iters=100)
+
+            T = solve_tensions_least_squares(
+                J, tau_des, T_prev=T_prev, Tmin=Tmin, Tmax=Tmax, lam=args.lamT, iters=80
+            )
+            T_prev = T
+
+            # -----------------------------
+            # Actuator feedforward (capstan inertia)
+            # -----------------------------
+            # Tendon payout rate/accel using reference kinematics:
+            #   sdot = J @ qdref
+            #   sdd  = J @ qddref + Jdot @ qdref   (optional Jdot term)
+            sdot = J @ qdref
+            sdd = J @ qddref
+
+            if (J_prev is not None) and (tJ_prev is not None):
+                dtJ = max(float(data.time - tJ_prev), 1e-9)
+                Jdot = (J - J_prev) / dtJ
+                sdd = sdd + (Jdot @ qdref)
+
+            # Motor-side kinematics
+            theta_dot = (gear_N / capstan_r) * sdot
+            theta_dd = (gear_N / capstan_r) * sdd
+
+            # Motor torque feedforward:
+            #   tau_T = (r/N) * T
+            #   tau_J = J_eq * theta_dd
+            #   tau_b = b_eq * theta_dot
+            tau_T = (capstan_r / gear_N) * T
+            tau_J = J_eq * theta_dd
+            tau_b = b_eq * theta_dot
+            tau_m_ff = tau_T + tau_J + tau_b
+
+            # Update J history
+            J_prev = J
+            tJ_prev = data.time
 
             # Explicit clamp (even though ctrllimited is set)
             T = np.clip(T, 0.0, Tmax)
@@ -363,6 +449,10 @@ def main():
             log_tau_ff[k, :] = tau_ff
             log_tau_fb[k, :] = tau_fb
             log_tau_des[k, :] = tau_des
+
+            log_tau_m_ff[k, :] = tau_m_ff
+            log_sdot[k, :] = sdot
+            log_sdd[k, :] = sdd
 
             log_T[k, :] = T
 
@@ -388,6 +478,9 @@ def main():
     log_tau_ff = log_tau_ff[:k]
     log_tau_fb = log_tau_fb[:k]
     log_tau_des = log_tau_des[:k]
+    log_tau_m_ff = log_tau_m_ff[:k]
+    log_sdot =  log_sdot[:k]
+    log_sdd  = log_sdd[:k]
     log_T = log_T[:k]
 
     np.savez(
@@ -399,6 +492,9 @@ def main():
         tau_ff=log_tau_ff,
         tau_fb=log_tau_fb,
         tau_des=log_tau_des,
+        tau_m_ff=log_tau_m_ff,
+        sdot=log_sdot,
+        sdd=log_sdd,
     )
 
     print("Saved sim_log.npz")
