@@ -17,6 +17,7 @@ Keys in animation window (matches your manual planner feel):
 
 from __future__ import annotations
 import numpy as np
+import csv
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
@@ -81,6 +82,85 @@ def plot_timeseries(traj: np.ndarray, title: str = "JugglePath XYZ kinematics"):
 
     fig.tight_layout()
     return fig
+
+# ----------------------------
+# Path output to pose_cmd.csv for simulation
+# ----------------------------
+def write_pose_cmd_csv(traj: np.ndarray, out_path: str = "pose_cmd.csv",
+                       roll_deg: float = 0.0, pitch_deg: float = 0.0, yaw_deg: float = 0.0):
+    """
+    Export JugglePath traj -> pose_cmd.csv format for MuJoCo sim.
+
+    traj: (N,13) columns [t,x,y,z, vx,vy,vz, ax,ay,az, jx,jy,jz] with SI units.
+    out CSV columns: t, x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg
+    """
+    if traj.ndim != 2 or traj.shape[1] < 4:
+        raise ValueError(f"traj must be (N,>=4). Got {traj.shape}")
+
+    t = traj[:, 0].astype(float)
+    xyz_m = traj[:, 1:4].astype(float)
+    xyz_mm = 1000.0 * xyz_m
+
+    # Ensure strictly increasing time (your sim loader also dedupes, but let's keep it clean)
+    keep = np.ones(len(t), dtype=bool)
+    keep[1:] = np.diff(t) > 1e-9
+    t = t[keep]
+    xyz_mm = xyz_mm[keep]
+
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t", "x_mm", "y_mm", "z_mm", "roll_deg", "pitch_deg", "yaw_deg"])
+        for i in range(len(t)):
+            w.writerow([
+                f"{t[i]:.9f}",
+                f"{xyz_mm[i,0]:.6f}",
+                f"{xyz_mm[i,1]:.6f}",
+                f"{xyz_mm[i,2]:.6f}",
+                f"{float(roll_deg):.6f}",
+                f"{float(pitch_deg):.6f}",
+                f"{float(yaw_deg):.6f}",
+            ])
+
+def write_pose_cmd_full_csv(traj: np.ndarray, out_path: str = "pose_cmd_full.csv",
+                            roll_deg: float = 0.0, pitch_deg: float = 0.0, yaw_deg: float = 0.0):
+    """
+    Export JugglePath traj -> full command CSV for MPC development.
+
+    traj: (N,13) [t,x,y,z,vx,vy,vz,ax,ay,az,jx,jy,jz] (SI units)
+    """
+    if traj.ndim != 2 or traj.shape[1] < 10:
+        raise ValueError(f"traj must be (N,>=10). Got {traj.shape}")
+
+    t = traj[:, 0].astype(float)
+    P = traj[:, 1:4].astype(float)
+    V = traj[:, 4:7].astype(float)
+    A = traj[:, 7:10].astype(float)
+
+    Pmm = 1000.0 * P
+
+    keep = np.ones(len(t), dtype=bool)
+    keep[1:] = np.diff(t) > 1e-9
+    t = t[keep]; Pmm = Pmm[keep]; V = V[keep]; A = A[keep]
+
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "t",
+            "x_mm", "y_mm", "z_mm",
+            "vx_mps", "vy_mps", "vz_mps",
+            "ax_mps2", "ay_mps2", "az_mps2",
+            "roll_deg", "pitch_deg", "yaw_deg",
+        ])
+        for i in range(len(t)):
+            w.writerow([
+                f"{t[i]:.9f}",
+                f"{Pmm[i,0]:.6f}", f"{Pmm[i,1]:.6f}", f"{Pmm[i,2]:.6f}",
+                f"{V[i,0]:.6f}",   f"{V[i,1]:.6f}",   f"{V[i,2]:.6f}",
+                f"{A[i,0]:.6f}",   f"{A[i,1]:.6f}",   f"{A[i,2]:.6f}",
+                f"{float(roll_deg):.6f}",
+                f"{float(pitch_deg):.6f}",
+                f"{float(yaw_deg):.6f}",
+            ])
 
 
 # ----------------------------
@@ -217,8 +297,8 @@ def build_demo_path(sample_hz: float = 500.0):
         v_max=1.0,
     )
 
-"""
-# 3d example
+    """
+    # 3d example
     # Segment 1: 0 -> -0.2 (down). Limit accel to 0.5g so the ball stays in the hand on initial accel down.
     path.add_segment(
         p=[-0.05, 0.0, -0.2],
@@ -258,7 +338,7 @@ def build_demo_path(sample_hz: float = 500.0):
     
     path.add_wait(duration=2.0)
 
-"""
+    """
 
     res = path.build()
     return res
@@ -267,6 +347,9 @@ def build_demo_path(sample_hz: float = 500.0):
 
 def main():
     res = build_demo_path(sample_hz=500.0)
+
+    write_pose_cmd_csv(res.traj, out_path="pose_cmd.csv", roll_deg=0.0, pitch_deg=0.0, yaw_deg=0.0)
+    write_pose_cmd_full_csv(res.traj, out_path="pose_cmd_full.csv", roll_deg=0.0, pitch_deg=0.0, yaw_deg=0.0)
 
     print("traj shape:", res.traj.shape)
     print("end state p:", res.end_state.p)
