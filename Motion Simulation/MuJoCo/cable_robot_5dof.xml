@@ -1,0 +1,67 @@
+<mujoco model="cable_robot_5dof">
+  <option timestep="0.0002" gravity="0 0 -9.81" integrator="RK4"/>
+  <size njmax="2000" nconmax="2000"/>
+  <default>
+    <joint damping="0.5" limited="false"/>
+    <geom density="500" friction="1 0.5 0.1" rgba="0.7 0.7 0.7 1"/>
+  </default>
+  <worldbody>
+    <geom type="plane" pos="0 0 -1.0" size="5 5 0.1" rgba="0.9 0.9 0.9 1"/>
+    <site name="a1" pos=" 0.530678  0.000000  0.445777" size="0.01" rgba="1 0 0 1"/>
+    <site name="a2" pos=" 0.530678  0.000000 -0.445777" size="0.01" rgba="1 0 0 1"/>
+    <site name="a3" pos="-0.265339  0.459581  0.445777" size="0.01" rgba="1 0 0 1"/>
+    <site name="a4" pos="-0.265339  0.459581 -0.445777" size="0.01" rgba="1 0 0 1"/>
+    <site name="a5" pos="-0.265339 -0.459581  0.445777" size="0.01" rgba="1 0 0 1"/>
+    <site name="a6" pos="-0.265339 -0.459581 -0.445777" size="0.01" rgba="1 0 0 1"/>
+    <body name="platform" pos="0 0 0">
+      <!-- 5 DOF: x,y,z translations + roll (x) + pitch (y). Yaw fixed. -->
+      <joint name="jx" type="slide" axis="1 0 0"/>
+      <joint name="jy" type="slide" axis="0 1 0"/>
+      <joint name="jz" type="slide" axis="0 0 1"/>
+      <joint name="jroll" type="hinge" axis="1 0 0"/>
+      <joint name="jpitch" type="hinge" axis="0 1 0"/>
+      <geom name="platform_geom" type="box" size="0.06 0.06 0.02" rgba="0.3 0.3 0.9 1"/>
+      <inertial pos="0 0 0" mass="0.108" diaginertia="0.000152 0.000152 0.000254"/>
+      <site name="p1" pos=" 0.057905  0.000000  0.000000" size="0.01" rgba="0 0 0 1"/>
+      <site name="p2" pos=" 0.049384  0.000000 -0.011149" size="0.01" rgba="0 0 0 1"/>
+      <site name="p3" pos="-0.028952  0.050147  0.000000" size="0.01" rgba="0 0 0 1"/>
+      <site name="p4" pos="-0.024692  0.042768 -0.011149" size="0.01" rgba="0 0 0 1"/>
+      <site name="p5" pos="-0.028952 -0.050147  0.000000" size="0.01" rgba="0 0 0 1"/>
+      <site name="p6" pos="-0.024692 -0.042768 -0.011149" size="0.01" rgba="0 0 0 1"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="cable1" limited="false" range="0 10">
+      <site site="a1"/>
+      <site site="p1"/>
+    </spatial>
+    <spatial name="cable2" limited="false" range="0 10">
+      <site site="a2"/>
+      <site site="p2"/>
+    </spatial>
+    <spatial name="cable3" limited="false" range="0 10">
+      <site site="a3"/>
+      <site site="p3"/>
+    </spatial>
+    <spatial name="cable4" limited="false" range="0 10">
+      <site site="a4"/>
+      <site site="p4"/>
+    </spatial>
+    <spatial name="cable5" limited="false" range="0 10">
+      <site site="a5"/>
+      <site site="p5"/>
+    </spatial>
+    <spatial name="cable6" limited="false" range="0 10">
+      <site site="a6"/>
+      <site site="p6"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="m1" tendon="cable1" gear="-1" ctrllimited="true" ctrlrange="0 150"/>
+    <motor name="m2" tendon="cable2" gear="-1" ctrllimited="true" ctrlrange="0 150"/>
+    <motor name="m3" tendon="cable3" gear="-1" ctrllimited="true" ctrlrange="0 150"/>
+    <motor name="m4" tendon="cable4" gear="-1" ctrllimited="true" ctrlrange="0 150"/>
+    <motor name="m5" tendon="cable5" gear="-1" ctrllimited="true" ctrlrange="0 150"/>
+    <motor name="m6" tendon="cable6" gear="-1" ctrllimited="true" ctrlrange="0 150"/>
+  </actuator>
+</mujoco>
